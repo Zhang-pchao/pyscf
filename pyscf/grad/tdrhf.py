@@ -90,9 +90,7 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None,
         dm = reduce(numpy.dot, (orbv, x.reshape(nvir,nocc)*2, orbo.T))
         v1ao = vresp(dm+dm.T)
         return reduce(numpy.dot, (orbv.T, v1ao, orbo)).ravel()
-    z1 = cphf.solve(fvind, mo_energy, mo_occ, wvo,
-                    max_cycle=td_grad.cphf_max_cycle,
-                    tol=td_grad.cphf_conv_tol)[0]
+    z1 = td_grad.solve_cphf(fvind, mo_energy, mo_occ, wvo)[0]
     z1 = z1.reshape(nvir,nocc)
     time1 = log.timer('Z-vector using CPHF solver', *time0)
 
@@ -278,6 +276,22 @@ class Gradients(rhf_grad.GradientsBase):
     @lib.with_doc(grad_elec.__doc__)
     def grad_elec(self, xy, singlet, atmlst=None):
         return grad_elec(self, xy, singlet, atmlst, self.max_memory, self.verbose)
+
+    def solve_cphf(self, fvind, mo_energy, mo_occ, h1):
+        """Solve the field-independent orbital response used by this gradient.
+
+        The default delegates to :func:`pyscf.scf.cphf.solve` with this
+        gradient's convergence settings. Subclasses may refine the response
+        before any gradient intermediates are constructed, without changing
+        the solver for other gradient instances.
+
+        ``h1`` has shape (nvir, nocc); ``fvind`` applies the response potential
+        in that orbital space. Return the CPHF pair (orbital response,
+        orbital-energy response); the latter is None for this problem.
+        """
+        return cphf.solve(fvind, mo_energy, mo_occ, h1,
+                          max_cycle=self.cphf_max_cycle,
+                          tol=self.cphf_conv_tol)
 
     def kernel(self, xy=None, state=None, singlet=None, atmlst=None):
         '''

@@ -134,6 +134,31 @@ def tearDownModule():
     del mol, pmol, mf
 
 class KnownValues(unittest.TestCase):
+    def test_cphf_solver_instance_hook(self):
+        td = tdscf.TDA(mf).run(nstates=nstates)
+        reference = td.nuc_grad_method().kernel(state=1)
+
+        class CheckedGradient(tdrhf_grad.Gradients):
+            calls = 0
+
+            def solve_cphf(self, fvind, mo_energy, mo_occ, h1):
+                self.calls += 1
+                response, energy_response = super().solve_cphf(
+                    fvind, mo_energy, mo_occ, h1)
+                self.response_shape = response.shape
+                return response, energy_response
+
+        checked = CheckedGradient(td)
+        actual = checked.kernel(state=1)
+        self.assertEqual(checked.calls, 1)
+        nocc = numpy.count_nonzero(mf.mo_occ)
+        self.assertEqual(checked.response_shape, (mf.mo_coeff.shape[1]-nocc, nocc))
+        self.assertAlmostEqual(abs(actual-reference).max(), 0, 10)
+        # A different instance retains the default solver and numerical result.
+        plain = td.nuc_grad_method()
+        self.assertIs(type(plain).solve_cphf, tdrhf_grad.Gradients.solve_cphf)
+        self.assertAlmostEqual(abs(plain.kernel(state=1)-reference).max(), 0, 10)
+
     def test_tda_singlet(self):
         td = tdscf.TDA(mf).run(nstates=nstates)
         g1ref = tda_kernel(td.nuc_grad_method(), td.xy[2]) + mf.nuc_grad_method().kernel()
