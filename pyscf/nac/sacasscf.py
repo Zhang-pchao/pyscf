@@ -191,7 +191,7 @@ class NonAdiabaticCouplings (sacasscf_grad.Gradients):
                     if ket > 0 else 0)
         offs_bra = (sum ([na * nb for na, nb in zip(
                          self.na_states[:bra], self.nb_states[:bra])])
-                    if ket > 0 else 0)
+                    if bra > 0 else 0)
         g_all[self.ngorb:][offs_ket:][:ndet_ket] = g_ci_ket
         g_all[self.ngorb:][offs_bra:][:ndet_bra] = g_ci_bra
         return g_all

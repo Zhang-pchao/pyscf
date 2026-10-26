@@ -151,6 +151,14 @@ class KnownValues(unittest.TestCase):
                 self.assertAlmostEqual(de[0], de_ref[i, 0], 5)
                 self.assertAlmostEqual(de[1], de_ref[i, 1], 5)
 
+    def test_nac_lih_reversed_state_response(self):
+        # Both orderings describe the same real off-diagonal response. A bra
+        # index greater than zero must use its own CI block even when ket=0.
+        mc_grad = diatomic('Li', 'H', 1.5, 'STO-3G', 2, 2, 2)
+        forward = mc_grad.kernel(state=(0, 1), use_etfs=False)
+        backward = mc_grad.kernel(state=(1, 0), use_etfs=False)
+        np.testing.assert_allclose(forward, -backward, atol=1e-10, rtol=0)
+
     def test_nac_lih_cms3ftlda22_sto3g(self):
         # z_orb:    yes
         # z_ci:     no
