@@ -74,6 +74,25 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(abs(a.dot(x) - b).max(), 0, 6)
         self.assertAlmostEqual(abs(x - numpy.linalg.solve(a,b)).max(), 0, 6)
 
+    def test_dependent_error_vectors(self):
+        ad = lib.diis.DIIS()
+        ad.update(numpy.array([1., 2.]), xerr=numpy.array([1., 2.]))
+        result = ad.update(numpy.array([3., 4.]), xerr=numpy.array([1., 2.]))
+        numpy.testing.assert_allclose(result, [2., 3.], rtol=0, atol=1e-12)
+
+    def test_complex_dependent_error_vectors(self):
+        ad = lib.diis.DIIS()
+        error = numpy.array([1., 1j])
+        ad.update(numpy.array([1.+1j, 2.-1j]), xerr=error)
+        result = ad.update(numpy.array([3.+1j, 4.-1j]), xerr=error)
+        numpy.testing.assert_allclose(result, [2.+1j, 3.-1j], rtol=0, atol=1e-12)
+
+    def test_nonfinite_error_vectors_rejected(self):
+        ad = lib.diis.DIIS()
+        ad.update(numpy.array([1., 2.]), xerr=numpy.array([1., 2.]))
+        with self.assertRaises(ValueError):
+            ad.update(numpy.array([3., 4.]), xerr=numpy.array([numpy.nan, 2.]))
+
     def test_extrapolate(self):
         a, b, adiag, arest, x = make_ab(16)
         ad = lib.diis.DIIS()

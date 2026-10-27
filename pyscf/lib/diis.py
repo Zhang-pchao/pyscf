@@ -251,7 +251,9 @@ class DIIS:
         g = numpy.zeros(nd+1, h.dtype)
         g[0] = 1
 
-        w, v = scipy.linalg.eigh(h)
+        # DIIS error vectors can produce tightly clustered near-zero roots.
+        # Divide-and-conquer avoids MRRR failures before dependence filtering.
+        w, v = scipy.linalg.eigh(h, driver='evd')
         if numpy.any(abs(w)<1e-14):
             logger.debug(self, 'Linear dependence found in DIIS error vectors.')
             idx = abs(w)>1e-14
