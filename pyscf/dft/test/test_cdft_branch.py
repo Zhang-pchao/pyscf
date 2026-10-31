@@ -609,6 +609,35 @@ class BranchFiltering(unittest.TestCase):
         # because the limits are the observed ones.
         self.assertIsNone(cdft_branch._branch_gap(points, 14.2, evidence))
 
+    def test_a_target_beyond_the_fold_is_not_a_gap(self):
+        # A target that lies beyond the upper branch limit is not inside the
+        # gap: the upper branch does reach it. The situation is different,
+        # because the bracketed branch stops at the fold and cannot get there.
+        #
+        # Measured on the V2-04c D1 case at the 1.33 Angstrom geometry: the
+        # fold limits are 12.434 and 13.786 while the target is 14.0. The
+        # refinement followed the lower branch and burned its whole
+        # iteration budget, and the caller learned only that it "did not
+        # converge". The target was reachable all along, from the other
+        # side of the fold.
+        evidence = [{'multiplier_hartree': 0.0088618,
+                     'population': 12.434053935,
+                     'bracket_prediction': 13.785830557,
+                     'anomaly_electrons': 0.21,
+                     'multivalued_confirmed': True,
+                     'fold': {'limits': [12.434053935, 13.785830557],
+                              'separation_electrons': 1.351776622}}]
+        # It is not a gap: the gap is strictly between the limits.
+        self.assertIsNone(cdft_branch._branch_gap([], 14.0, evidence))
+        # But it is reported as reachable only from the other branch.
+        unreachable = cdft_branch._branch_unreachable(evidence, 14.0)
+        self.assertIsNotNone(unreachable)
+        self.assertIn('only from the other branch', unreachable)
+        # A target inside the gap is not reported this way.
+        self.assertIsNone(cdft_branch._branch_unreachable(evidence, 13.0))
+        # A target below the lower limit is out of range, not beyond a fold.
+        self.assertIsNone(cdft_branch._branch_unreachable(evidence, 12.0))
+
     def test_the_refinement_never_repeats_a_rejected_multiplier(self):
         # The bisection of an unchanged bracket is a fixed point. When a
         # trial is rejected the bracket must shrink, or the refinement

@@ -351,6 +351,49 @@ def _branch_gap(converged_points, target, discontinuity_evidence=None):
     return None
 
 
+def _branch_unreachable(discontinuity_evidence, target):
+    '''Describe a target that only the other branch can reach.
+
+    A confirmed fold has two limits. When the target lies strictly between
+    them, it is a structural gap: neither branch reaches it. When the target
+    lies *beyond* the upper limit, the situation is different: the upper
+    branch does reach it, but the branch that the refinement was following
+    does not, so the refinement cannot get there from the bracketed side.
+
+    The two situations must not be conflated. A gap is a statement about the
+    model: no branch attains the target. A target beyond the fold is a
+    statement about the *search*: the target exists, but the warm start has
+    to be taken from the other side of the fold. Reporting the second as a
+    bare failure to converge hides the fact that the target is attainable.
+
+    Measured on the V2-04c D1 case at the 1.33 Angstrom geometry: the fold
+    limits are 12.434 and 13.786 while the target is 14.0, so the target is
+    reachable only from the upper branch. The refinement followed the lower
+    branch and consumed its whole iteration budget before the caller learned
+    only that it "did not converge".
+
+    Returns a description string, or ``None`` when no such fold was observed.
+    '''
+    best = None
+    for evidence in (discontinuity_evidence or []):
+        fold = evidence.get('fold')
+        if fold is None:
+            continue
+        limits = [float(x) for x in fold['limits']]
+        if len(limits) < 2:
+            continue
+        lower, upper = min(limits), max(limits)
+        if target > upper:
+            best = (lower, upper)
+    if best is None:
+        return None
+    lower, upper = best
+    return ('the target population %.6g lies beyond the upper branch limit '
+            '%.6f; it is attainable only from the other branch, and the '
+            'bracketed branch stops at %.6f'
+            % (target, upper, lower))
+
+
 def _branch_summary(converged_points, branch_tol=0.2):
     '''Summarise the distinct branches that the scan visited.
 
@@ -580,6 +623,10 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     # Whether a confirmed fold has already shown that the target lies in a
     # structural gap. When it has, the refinement stops immediately.
     structural_gap = False
+    # Whether a confirmed fold has shown that the target lies beyond the
+    # upper limit of the bracketed branch, so that it is reachable only from
+    # the other branch.
+    needs_other_branch = False
     for _ in range(max_iterations):
         denominator = right_pop-left_pop
         if abs(denominator) < 1e-14:
@@ -722,10 +769,37 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                              'the branch limits %.9f and %.9f; the refinement '
                              'stops without a root' % (target, fold_lower,
                                                       fold_upper))
+                elif target >= fold_upper:
+                    # The target lies beyond the upper limit of the fold, so
+                    # it is *not* inside the gap: the upper branch reaches it.
+                    # The refinement nevertheless cannot reach it, because the
+                    # warm start follows the branch that the bracket is on and
+                    # that branch stops at the fold. This is a different
+                    # situation from a gap, and it must be reported as a
+                    # different situation.
+                    #
+                    # Measured on the V2-04c D1 case at the 1.33 Angstrom
+                    # geometry: the fold limits are 12.434 and 13.786 while the
+                    # target is 14.0, so the target is reachable in principle
+                    # but not from the bracketed branch. Without this
+                    # distinction the refinement burns its whole iteration
+                    # budget and the caller reports "did not converge", which
+                    # reads like a numerical failure.
+                    needs_other_branch = True
+                    if emit is not None:
+                        emit('  OTHER BRANCH: the target %.9g lies beyond the '
+                             'upper fold limit %.9f; it is reachable only from '
+                             'the other branch, not from this one'
+                             % (target, fold_upper))
             discontinuity_evidence.append(evidence)
         if structural_gap:
             # The evidence for the gap is complete. The refinement ends here,
             # and the caller turns the evidence into a BranchGapError.
+            return None, discontinuity_evidence
+        if needs_other_branch:
+            # The target is on the other side of the fold. The refinement ends
+            # here as well, and the caller reports the situation instead of a
+            # bare failure to converge.
             return None, discontinuity_evidence
         crossed = (trial_fingerprint.density_overlap < density_tol)
         identity_changed = False
@@ -1102,14 +1176,25 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             # electronic branches. That is a statement about the model, not
             # about the numerics, and it must be reported as such.
             gap = _branch_gap(converged_points, target, discontinuity_evidence)
+            unreachable = None
             if gap is not None:
                 reason = ('the target population %.6g lies in a gap between two '
                           'electronic branches: %s' % (target, gap))
+            else:
+                # The target may be attainable, but only from the branch that
+                # the refinement did not follow. This is not a gap and not a
+                # numerical failure; it is a statement about where the search
+                # has to start.
+                unreachable = _branch_unreachable(discontinuity_evidence, target)
+                if unreachable is not None:
+                    reason = ('the target population %.6g is not reached by '
+                              'the bracketed branch: %s' % (target, unreachable))
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
                                      'points': points, 'switches': switches,
                                      'branches': branches,
                                      'rejected_by_branch': rejected_by_branch,
                                      'branch_gap': gap,
+                                     'branch_unreachable': unreachable,
                                      'discontinuities': discontinuity_evidence,
                                      'log': list(records)}
             if gap is not None:
