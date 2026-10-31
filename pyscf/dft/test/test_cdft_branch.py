@@ -255,6 +255,154 @@ class BranchAwareScan(unittest.TestCase):
             cdft_branch.solve_branch_aware(mf, w, .4, scan_points=7,
                                            required_signed_spin=5.0)
 
+    def test_failed_branch_requirement_reports_reachable_branches(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        with self.assertRaises(cdft.ConvergenceError):
+            cdft_branch.solve_branch_aware(mf, w, .4, scan_points=7,
+                                           required_signed_spin=5.0)
+        # The diagnostic must state which branches were actually reachable,
+        # so that the operator can state the intended identity instead of
+        # guessing a tolerance.
+        scan = cdft.LAST_BRANCH_SCAN
+        self.assertIn('branches', scan)
+        self.assertTrue(scan['branches'])
+        for cluster in scan['branches']:
+            self.assertIn('signed_spin', cluster)
+            self.assertIn('multiplier_range', cluster)
+        self.assertIn('rejected_by_branch', scan)
+
+
+class BranchFiltering(unittest.TestCase):
+    '''A required branch identity must select a branch, not just reject one.'''
+
+    def test_branch_mismatch_reports_the_first_violation(self):
+        fingerprint = cdft_branch.BranchFingerprint(
+            spin_square=2.0, signed_spin=1.0, atom_spins=(0.5, -0.5),
+            population=1.0)
+        self.assertIsNone(cdft_branch._branch_mismatch(fingerprint, None, None,
+                                                       0.2))
+        self.assertIsNone(cdft_branch._branch_mismatch(fingerprint, 1.0, None,
+                                                       0.2))
+        self.assertIsNotNone(cdft_branch._branch_mismatch(fingerprint, 5.0, None,
+                                                          0.2))
+        self.assertIsNotNone(cdft_branch._branch_mismatch(
+            fingerprint, None, {0: 3.0}, 0.2))
+        # An atom index beyond the fingerprint must be reported rather than
+        # silently skipped.
+        self.assertIsNotNone(cdft_branch._branch_mismatch(
+            fingerprint, None, {7: 1.0}, 0.2))
+
+    def test_branch_summary_clusters_by_signed_spin(self):
+        def point(multiplier, signed_spin):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=signed_spin, signed_spin=signed_spin,
+                atom_spins=(signed_spin,), population=multiplier)
+            return (multiplier, multiplier, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        clusters = cdft_branch._branch_summary([point(-1., 1.), point(-0.5, 1.),
+                                                point(0.5, 3.)])
+        self.assertEqual(len(clusters), 2)
+        self.assertAlmostEqual(clusters[0]['signed_spin'], 1.)
+        self.assertEqual(clusters[0]['n_points'], 2)
+        self.assertAlmostEqual(clusters[0]['multiplier_range'][0], -1.)
+        self.assertAlmostEqual(clusters[0]['multiplier_range'][1], -0.5)
+        self.assertAlmostEqual(clusters[1]['signed_spin'], 3.)
+        self.assertEqual(clusters[1]['n_points'], 1)
+
+    def test_required_identity_selects_the_matching_branch(self):
+        # The constrained response is multivalued. A required identity must
+        # be applied as a filter over the scan, so that a root on another
+        # branch does not destroy a solution that does exist.
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        reference = cdft_branch.solve_branch_aware(mf, w, .4, scan_points=9,
+                                                    scan_upper=.5)
+        signed_spin = reference.branch_scan.points[0]['fingerprint']['signed_spin']
+        # Requiring the identity that the scan actually produced must still
+        # converge, and the accepted root must carry it.
+        accepted = cdft_branch.solve_branch_aware(
+            mf, w, .4, scan_points=9, scan_upper=.5,
+            required_signed_spin=signed_spin)
+        self.assertLess(abs(accepted.population-.4), 1e-8)
+        self.assertAlmostEqual(accepted.branch_scan.points[-1]['fingerprint']
+                               ['signed_spin'], signed_spin, 6)
+        self.assertTrue(hasattr(accepted, 'branch_clusters'))
+
+    def test_refinement_rejects_a_trial_on_the_wrong_branch(self):
+        # A refinement trial whose fingerprint violates the required identity
+        # must be rejected instead of being returned as the root.
+        calls = {'count': 0}
+
+        class FakeState:
+            def __init__(self, population, signed_spin):
+                self.e_tot = -1.0
+                self._population = population
+                self._signed_spin = signed_spin
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def inner_solve(multiplier, start_density):
+            calls['count'] += 1
+            # The trial leaves the required branch, so it must be rejected.
+            return FakeState(0.4+0.1*multiplier, 5.0), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        points = [(-1.0, 0.3, 0.0, None, None, np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, None, np.array([[[0.5]]]))]
+        # The branch check rejects every trial fingerprint.
+        def branch_check(fingerprint):
+            return 'wrong branch'
+
+        refined = cdft_branch._refine(
+            points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+            max_iterations=20, branch_check=branch_check)
+        self.assertIsNone(refined)
+
+    def test_refinement_only_brackets_consistent_branch_points(self):
+        # When a branch identity is required, the bracket may only be formed
+        # from points that satisfy it. Otherwise the refinement could walk
+        # onto a different electronic branch.
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def inner_solve(multiplier, start_density):
+            return FakeState(0.4+0.1*multiplier), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        def fingerprint(signed_spin):
+            return cdft_branch.BranchFingerprint(
+                spin_square=signed_spin, signed_spin=signed_spin,
+                atom_spins=(signed_spin,), population=0.0)
+
+        # The straddling pair is (-1.0, 0.3) and (1.0, 0.5). Only the second
+        # one satisfies the required identity, so no bracket may be formed.
+        points = [(-1.0, 0.3, 0.0, None, fingerprint(5.0),
+                   np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, fingerprint(1.0),
+                   np.array([[[0.5]]]))]
+        refined = cdft_branch._refine(
+            points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+            max_iterations=20,
+            branch_check=lambda fp: None if fp.signed_spin == 1.0 else 'wrong')
+        self.assertIsNone(refined)
+
 
 if __name__ == '__main__':
     unittest.main()

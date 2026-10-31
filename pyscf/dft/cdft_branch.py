@@ -159,8 +159,67 @@ def _scan_axis(bound, scan_points, scan_mode):
     return np.unique(axis)
 
 
+def _branch_mismatch(fingerprint, required_signed_spin, required_atom_spins,
+                     spin_tol):
+    '''Return a reason string when the fingerprint violates the required identity.
+
+    ``None`` means the fingerprint satisfies every requirement. The check is
+    deliberately a pure function of the fingerprint so that it can be applied
+    to every scan point, to every refinement trial and to the finally
+    accepted root with exactly the same semantics.
+    '''
+    if required_signed_spin is not None:
+        if abs(fingerprint.signed_spin-required_signed_spin) > spin_tol:
+            return ('signed total spin %.6g does not match the required %.6g'
+                    % (fingerprint.signed_spin, required_signed_spin))
+    if required_atom_spins:
+        for atom_index in sorted(required_atom_spins):
+            expected = required_atom_spins[atom_index]
+            if atom_index >= len(fingerprint.atom_spins):
+                return ('atom %d carries no fingerprint in this state' % atom_index)
+            observed = fingerprint.atom_spins[atom_index]
+            if abs(observed-expected) > spin_tol:
+                return ('atom %d carries signed spin %.6g, required %.6g'
+                        % (atom_index, observed, expected))
+    return None
+
+
+def _branch_summary(converged_points):
+    '''Summarise the distinct branches that the scan visited.
+
+    The summary is what makes a failed branch requirement actionable: it
+    states which signed spins were actually reachable, so that the operator
+    can state the intended branch identity instead of guessing a tolerance.
+    '''
+    clusters = []
+    for multiplier, population, energy, state, fingerprint, density in converged_points:
+        placed = False
+        for cluster in clusters:
+            if abs(cluster['signed_spin']-fingerprint.signed_spin) <= 0.2:
+                cluster['multiplier_range'][0] = min(cluster['multiplier_range'][0],
+                                                     multiplier)
+                cluster['multiplier_range'][1] = max(cluster['multiplier_range'][1],
+                                                     multiplier)
+                cluster['population_range'][0] = min(cluster['population_range'][0],
+                                                     population)
+                cluster['population_range'][1] = max(cluster['population_range'][1],
+                                                     population)
+                cluster['n_points'] += 1
+                placed = True
+                break
+        if not placed:
+            clusters.append({'signed_spin': fingerprint.signed_spin,
+                             'spin_square': fingerprint.spin_square,
+                             'atom_spins': list(fingerprint.atom_spins),
+                             'multiplier_range': [multiplier, multiplier],
+                             'population_range': [population, population],
+                             'n_points': 1})
+    return clusters
+
+
 def _refine(converged_points, target, population_tol, inner_solve, density_tol,
-            population_of, overlap, eigvals, eigvecs, max_iterations=40, emit=None):
+            population_of, overlap, eigvals, eigvecs, max_iterations=40, emit=None,
+            branch_check=None):
     '''Polish a bracket on a single branch with a guarded secant iteration.
 
     The bracket is formed from two neighbouring scan points whose populations
@@ -178,10 +237,26 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     Args:
         population_of: callable mapping a density matrix to its constraint
             population.
+        branch_check: optional callable mapping a fingerprint to a reason string
+            when the fingerprint violates the required branch identity, and to
+            ``None`` when it satisfies it. When given, only branch-consistent
+            scan points may form the bracket, and a refinement trial whose
+            fingerprint violates the identity is rejected instead of being
+            accepted as the root.
     '''
     if len(converged_points) < 2:
         return None
     ordered = sorted(converged_points, key=lambda item: item[0])
+    # When a branch identity is required, the bracket may only be formed from
+    # points on a branch that satisfies it. Otherwise the refinement could
+    # walk onto a different electronic branch and return a state that does
+    # not carry the requested identity.
+    if branch_check is not None:
+        allowed = [item for item in ordered
+                   if branch_check(item[4]) is None]
+        ordered = allowed
+        if len(ordered) < 2:
+            return None
     bracket = None
     for lower, upper in zip(ordered[:-1], ordered[1:]):
         if (lower[1]-target)*(upper[1]-target) <= 0:
@@ -232,13 +307,27 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             break
         density = np.asarray(state.make_rdm1())
         population = population_of(density)
+        trial_fingerprint = _fingerprint(state, density, population, overlap,
+                                         eigvals, eigvecs, previous_density)
+        if branch_check is not None:
+            mismatch = branch_check(trial_fingerprint)
+            if mismatch is not None:
+                # The trial landed on a different electronic branch. It is
+                # rejected rather than accepted, because accepting it would
+                # return a state that does not carry the requested identity.
+                if emit is not None:
+                    emit('  REFINE lambda=%+.12g REJECTED (%s)'
+                         % (clipped, mismatch))
+                # The bracket endpoint that produced this branch is the one
+                # that carries the required identity, so the refinement keeps
+                # its bracket and tries a different trial point.
+                break
         if emit is not None:
             emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g'
                  % (clipped, population, population-target))
         if abs(population-target) <= population_tol:
             energy = float(state.e_tot-clipped*population)
-            fingerprint = _fingerprint(state, density, population, overlap,
-                                       eigvals, eigvecs, previous_density)
+            fingerprint = trial_fingerprint
             return clipped, population, energy, state, fingerprint, density
         # Update the bracket so that it always straddles the target.
         if (population-target)*(left_pop-target) <= 0:
@@ -279,9 +368,13 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             produced, so that a long scan stays observable.
         scan_upper: optional tighter bound on |lambda| for the scan axis.
         required_signed_spin: optional signed total spin that the accepted root
-            must reproduce within ``spin_tol``.
+            must reproduce within ``spin_tol``. When it is given, the scan
+            points that do not carry that identity are *filtered out* rather
+            than being accepted and then rejected, so that a solution which
+            exists elsewhere on the multiplier axis is still found.
         required_atom_spins: optional mapping from atom index to the signed
-            spin that atom must carry.
+            spin that atom must carry. It acts as a filter in the same way as
+            ``required_signed_spin``.
         refine: when true, the accepted grid root is polished with a local
             secant refinement that stays on the same branch.
         scf_tol_grad: optional explicit orbital-gradient tolerance for the
@@ -447,22 +540,49 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         raise cdft.ConvergenceError(
             'Branch scan found no converged constrained state: %s' % reason)
 
+    # The required branch identity, if any, is applied as a filter over the
+    # scan points and not only as a check on the finally accepted root. A
+    # filter is required because the constrained response is multivalued: the
+    # scan may well visit the requested branch somewhere else on the
+    # multiplier axis, and rejecting the whole solve would then discard a
+    # solution that does exist.
+    branch_check = None
+    if required_signed_spin is not None or required_atom_spins:
+        def branch_check(fingerprint, _ss=required_signed_spin,
+                         _as=required_atom_spins, _tol=spin_tol):
+            return _branch_mismatch(fingerprint, _ss, _as, _tol)
+
+    branches = _branch_summary(converged_points)
+
     # Select the point that best satisfies the constraint. A point is only
     # acceptable when it lies on a contiguous branch, that is, when the
-    # density overlap with its predecessor is above the threshold.
+    # density overlap with its predecessor is above the threshold, and when
+    # it carries the required branch identity.
     candidates = []
+    rejected_by_branch = []
     for index, (multiplier, population, energy, state, fingerprint, dens) in enumerate(converged_points):
         residual = abs(population-target)
         if residual > population_tol:
             continue
+        if branch_check is not None:
+            mismatch = branch_check(fingerprint)
+            if mismatch is not None:
+                rejected_by_branch.append({
+                    'multiplier_hartree': multiplier,
+                    'residual': float(population-target),
+                    'signed_spin': fingerprint.signed_spin,
+                    'reason': mismatch})
+                continue
         candidates.append((residual, index, multiplier, population, energy,
                            state, fingerprint, dens))
     if not candidates:
-        # No grid point is exact enough. Refine the bracketing interval on the
-        # same branch; only if that fails is the scan declared unsuccessful.
+        # No grid point is exact enough on the required branch. Refine the
+        # bracketing interval on the same branch; only if that fails is the
+        # scan declared unsuccessful.
         refined = _refine(converged_points, target, population_tol, inner_solve,
                           density_tol, lambda d: constraint.population(d),
-                          overlap, eigvals, eigvecs, max_iterations, emit)
+                          overlap, eigvals, eigvecs, max_iterations, emit,
+                          branch_check)
         if refined is not None:
             multiplier, population, energy, state, fingerprint, dens = refined
             root = multiplier
@@ -479,6 +599,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                       % (abs(closest[1]-target), closest[0]))
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
                                      'points': points, 'switches': switches,
+                                     'branches': branches,
+                                     'rejected_by_branch': rejected_by_branch,
                                      'log': list(records)}
             raise BranchSwitchError(
                 'Branch scan did not reach the population target: %s' % reason)
@@ -490,26 +612,20 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     root_state = state
     root_fingerprint = fingerprint
 
-    if required_signed_spin is not None:
-        if abs(fingerprint.signed_spin-required_signed_spin) > spin_tol:
+    if branch_check is not None:
+        # The filter already guarantees this, but the accepted root is
+        # checked once more so that a future change to the filter cannot
+        # silently return a state with the wrong branch identity.
+        mismatch = branch_check(fingerprint)
+        if mismatch is not None:
             reason = ('accepted root has signed spin %.6g, required %.6g'
                       % (fingerprint.signed_spin, required_signed_spin))
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
                                      'points': points, 'switches': switches,
+                                     'branches': branches,
+                                     'rejected_by_branch': rejected_by_branch,
                                      'log': list(records)}
             raise cdft.ConvergenceError('Branch identity check failed: %s' % reason)
-    if required_atom_spins:
-        for atom_index, expected in required_atom_spins.items():
-            if atom_index >= len(fingerprint.atom_spins):
-                continue
-            observed = fingerprint.atom_spins[atom_index]
-            if abs(observed-expected) > spin_tol:
-                reason = ('atom %d carries signed spin %.6g, required %.6g'
-                          % (atom_index, observed, expected))
-                cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
-                                         'points': points, 'switches': switches,
-                                         'log': list(records)}
-                raise cdft.ConvergenceError('Branch identity check failed: %s' % reason)
 
     scan = BranchScan(converged=True, root=root, population=population,
                       energy=energy, points=points, switches=switches, reason='')
@@ -518,4 +634,6 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     result.branch_scan = scan
     result.branch_switches = switches
     result.branch_density = root_density
+    result.branch_clusters = branches
+    result.branch_rejected = rejected_by_branch
     return result
