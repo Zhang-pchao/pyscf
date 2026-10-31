@@ -403,6 +403,53 @@ class BranchFiltering(unittest.TestCase):
             branch_check=lambda fp: None if fp.signed_spin == 1.0 else 'wrong')
         self.assertIsNone(refined)
 
+    def test_refinement_rejects_a_trial_that_crosses_a_branch_boundary(self):
+        # A refinement trial whose density overlap with the previous accepted
+        # point falls below the threshold belongs to a different electronic
+        # branch. Accepting it would let the secant step oscillate across the
+        # discontinuity of the multivalued constrained response and never
+        # converge, while the iteration still looks healthy. The trial must be
+        # rejected and the iteration must continue inside the bracket.
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        # The inner solve returns a population on the wrong branch for part of
+        # the axis. The fingerprint is built from the real solver helper, so
+        # the density overlap is computed exactly as in production.
+        def inner_solve(multiplier, start_density):
+            return FakeState(0.4+0.1*multiplier), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        def fingerprint(population):
+            return cdft_branch.BranchFingerprint(
+                spin_square=2.0, signed_spin=1.0, atom_spins=(1.0,),
+                population=population, density_overlap=0.1)
+
+        points = [(-1.0, 0.3, 0.0, None, fingerprint(0.3), np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, fingerprint(0.5), np.array([[[0.5]]]))]
+        # The fingerprint helper is patched so that every trial reports a low
+        # overlap. The refinement must then reject every trial and must not
+        # return a root.
+        original = cdft_branch._fingerprint
+        try:
+            cdft_branch._fingerprint = (lambda *args, **kwargs:
+                                        fingerprint(0.4))
+            refined = cdft_branch._refine(
+                points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+                np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+                max_iterations=20)
+        finally:
+            cdft_branch._fingerprint = original
+        self.assertIsNone(refined)
+
 
 if __name__ == '__main__':
     unittest.main()

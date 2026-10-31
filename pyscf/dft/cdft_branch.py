@@ -272,6 +272,7 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     left_density = np.asarray(bracket[0][5])
     right_density = np.asarray(bracket[1][5])
     previous_density = right_density
+    force_bisect = False
     for _ in range(max_iterations):
         denominator = right_pop-left_pop
         if abs(denominator) < 1e-14:
@@ -282,12 +283,17 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                                  max(left_mult, right_mult)))
         # A secant step that leaves the bracket, or that degenerates, is
         # replaced by a bisection. This keeps the bracket contracting even
-        # when the response curve is strongly nonlinear.
-        secant_is_usable = (abs(trial-clipped) < 1e-12
+        # when the response curve is strongly nonlinear. A trial that was
+        # rejected for crossing a branch boundary also forces a bisection, so
+        # that the iteration approaches the bracket centre instead of
+        # repeatedly stepping across the same discontinuity.
+        secant_is_usable = (not force_bisect
+                            and abs(trial-clipped) < 1e-12
                             and min(left_mult, right_mult) < clipped
                             < max(left_mult, right_mult))
         if not secant_is_usable:
             clipped = 0.5*(left_mult+right_mult)
+        force_bisect = False
         # Warm start from the bracket endpoint nearer to the trial.
         if abs(clipped-left_mult) <= abs(clipped-right_mult):
             start_density = left_density
@@ -309,7 +315,28 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
         population = population_of(density)
         trial_fingerprint = _fingerprint(state, density, population, overlap,
                                          eigvals, eigvecs, previous_density)
-        if branch_check is not None:
+        # The branch-boundary guard. A refinement step that crosses a branch
+        # boundary is rejected, because the warm start may follow the other
+        # branch and the trial would then report a population that belongs to
+        # a different electronic state. Without this guard the secant step
+        # oscillates across the discontinuity of the multivalued response and
+        # never converges, while the iteration still looks healthy.
+        crossed = (trial_fingerprint.density_overlap < density_tol)
+        if crossed:
+            if emit is not None:
+                emit('  REFINE lambda=%+.12g REJECTED (density overlap %.6g '
+                     'below threshold %.6g)'
+                     % (clipped, trial_fingerprint.density_overlap, density_tol))
+            # The trial crossed the boundary, so it carries no information
+            # about the branch that is bracketed. The bracket is not updated
+            # and the next iteration bisects instead of taking a secant step,
+            # which moves the trial point towards the bracket centre and away
+            # from the boundary. The warm start is taken from the endpoint
+            # that is known to be on the bracketed branch.
+            force_bisect = True
+        else:
+            force_bisect = False
+        if not crossed and branch_check is not None:
             mismatch = branch_check(trial_fingerprint)
             if mismatch is not None:
                 # The trial landed on a different electronic branch. It is
@@ -322,23 +349,27 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 # that carries the required identity, so the refinement keeps
                 # its bracket and tries a different trial point.
                 break
-        if emit is not None:
+        if emit is not None and not crossed:
             emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g'
                  % (clipped, population, population-target))
-        if abs(population-target) <= population_tol:
+        if not crossed and abs(population-target) <= population_tol:
             energy = float(state.e_tot-clipped*population)
             fingerprint = trial_fingerprint
             return clipped, population, energy, state, fingerprint, density
-        # Update the bracket so that it always straddles the target.
-        if (population-target)*(left_pop-target) <= 0:
-            right_mult, right_pop = left_mult, left_pop
-            right_density = left_density
-            left_mult, left_pop = clipped, population
-            left_density = density
-        else:
-            left_mult, left_pop = clipped, population
-            left_density = density
-        previous_density = density
+        if not crossed:
+            # Update the bracket so that it always straddles the target.
+            if (population-target)*(left_pop-target) <= 0:
+                right_mult, right_pop = left_mult, left_pop
+                right_density = left_density
+                left_mult, left_pop = clipped, population
+                left_density = density
+            else:
+                left_mult, left_pop = clipped, population
+                left_density = density
+            previous_density = density
+        # A crossed trial is discarded: it carries no information about the
+        # bracketed branch, so neither the bracket nor the warm-start
+        # reference is updated from it.
     return None
 
 
