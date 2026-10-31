@@ -149,6 +149,53 @@ class BranchAwareScan(unittest.TestCase):
         self.assertTrue(streamed)
         self.assertTrue(any('lambda=' in message for message in streamed))
 
+    def test_refinement_reaches_a_target_between_two_scan_points(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        # A coarse scan whose grid points all miss the target must still be
+        # refined onto the root. The refinement has to keep a straddling
+        # bracket and fall back to bisection when the secant step leaves it.
+        coarse = cdft_branch.solve_branch_aware(
+            mf, w, .4, scan_points=5, scan_upper=.5)
+        self.assertLess(abs(coarse.population-.4), 1e-8)
+
+    def test_refinement_survives_a_failing_inner_solve(self):
+        # A warm start density that always fails must not abort the
+        # refinement before it has retried from the other bracket endpoint.
+        calls = {'count': 0}
+
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+
+            def make_rdm1(self):
+                # A UKS state carries two spin blocks.
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def inner_solve(multiplier, start_density):
+            calls['count'] += 1
+            if calls['count'] % 2 == 1:
+                raise cdft.ConvergenceError('synthetic failure')
+            # A monotone response around the target at lambda = 0.
+            return FakeState(0.4 + 0.1*multiplier), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        # Two bracket points straddling the target 0.4.
+        points = [(-1.0, 0.3, 0.0, None, None, np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, None, np.array([[[0.5]]]))]
+        refined = cdft_branch._refine(
+            points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+            max_iterations=20)
+        self.assertIsNotNone(refined)
+        self.assertLess(abs(refined[1]-0.4), 1e-8)
+        self.assertGreater(calls['count'], 1)
+
     def test_scan_reports_failure_without_opaque_root_error(self):
         xyz = np.array([[0., 0., -.5], [0, 0., .5]])
         mf = setup(xyz)

@@ -160,13 +160,20 @@ def _scan_axis(bound, scan_points, scan_mode):
 
 
 def _refine(converged_points, target, population_tol, inner_solve, density_tol,
-            population_of, overlap, eigvals, eigvecs):
+            population_of, overlap, eigvals, eigvecs, max_iterations=40):
     '''Polish a bracket on a single branch with a guarded secant iteration.
 
     The bracket is formed from two neighbouring scan points whose populations
     straddle the target. The refinement only accepts a step when the density
     overlap with the previous point stays above ``density_tol``, so the
     iteration cannot silently cross a branch boundary.
+
+    The bracket is maintained explicitly. A secant step is taken when it stays
+    inside the bracket, and a bisection is used when the secant step is
+    degenerate or when the inner solve at the secant point fails. A failed
+    inner solve is retried from the other bracket endpoint before the
+    iteration gives up, because the warm start density decides which branch
+    the inner solver follows.
 
     Args:
         population_of: callable mapping a density matrix to its constraint
@@ -184,29 +191,58 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
         return None
     left_mult, left_pop = bracket[0][0], bracket[0][1]
     right_mult, right_pop = bracket[1][0], bracket[1][1]
-    previous_density = bracket[1][5]
-    for _ in range(12):
+    # The warm start density decides which branch the inner solver follows.
+    # Start from the endpoint that is closer in multiplier to the target, so
+    # that the iteration stays on the branch that brackets the root.
+    left_density = np.asarray(bracket[0][5])
+    right_density = np.asarray(bracket[1][5])
+    previous_density = right_density
+    for _ in range(max_iterations):
         denominator = right_pop-left_pop
         if abs(denominator) < 1e-14:
             break
         # Standard secant step on f(lambda) = C(lambda) - target.
         trial = right_mult-(right_pop-target)*(right_mult-left_mult)/denominator
-        trial = float(np.clip(trial, min(left_mult, right_mult),
-                              max(left_mult, right_mult)))
-        try:
-            state, _ = inner_solve(trial, previous_density)
-        except cdft.ConvergenceError:
+        clipped = float(np.clip(trial, min(left_mult, right_mult),
+                                 max(left_mult, right_mult)))
+        # A secant step that leaves the bracket, or that degenerates, is
+        # replaced by a bisection. This keeps the bracket contracting even
+        # when the response curve is strongly nonlinear.
+        secant_is_usable = (abs(trial-clipped) < 1e-12
+                            and min(left_mult, right_mult) < clipped
+                            < max(left_mult, right_mult))
+        if not secant_is_usable:
+            clipped = 0.5*(left_mult+right_mult)
+        # Warm start from the bracket endpoint nearer to the trial.
+        if abs(clipped-left_mult) <= abs(clipped-right_mult):
+            start_density = left_density
+        else:
+            start_density = right_density
+        state = None
+        for candidate in (start_density, left_density, right_density):
+            try:
+                state, _ = inner_solve(clipped, candidate)
+                break
+            except cdft.ConvergenceError:
+                continue
+        if state is None:
             break
         density = np.asarray(state.make_rdm1())
         population = population_of(density)
         if abs(population-target) <= population_tol:
-            energy = float(state.e_tot-trial*population)
+            energy = float(state.e_tot-clipped*population)
             fingerprint = _fingerprint(state, density, population, overlap,
                                        eigvals, eigvecs, previous_density)
-            return trial, population, energy, state, fingerprint, density
-        if (population-target)*(right_pop-target) <= 0:
-            left_mult, left_pop = right_mult, right_pop
-        right_mult, right_pop = trial, population
+            return clipped, population, energy, state, fingerprint, density
+        # Update the bracket so that it always straddles the target.
+        if (population-target)*(left_pop-target) <= 0:
+            right_mult, right_pop = left_mult, left_pop
+            right_density = left_density
+            left_mult, left_pop = clipped, population
+            left_density = density
+        else:
+            left_mult, left_pop = clipped, population
+            left_density = density
         previous_density = density
     return None
 
@@ -420,7 +456,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         # same branch; only if that fails is the scan declared unsuccessful.
         refined = _refine(converged_points, target, population_tol, inner_solve,
                           density_tol, lambda d: constraint.population(d),
-                          overlap, eigvals, eigvecs)
+                          overlap, eigvals, eigvecs, max_iterations)
         if refined is not None:
             multiplier, population, energy, state, fingerprint, dens = refined
             root = multiplier
