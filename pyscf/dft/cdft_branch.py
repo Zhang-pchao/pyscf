@@ -160,7 +160,7 @@ def _scan_axis(bound, scan_points, scan_mode):
 
 
 def _refine(converged_points, target, population_tol, inner_solve, density_tol,
-            population_of, overlap, eigvals, eigvecs, max_iterations=40):
+            population_of, overlap, eigvals, eigvecs, max_iterations=40, emit=None):
     '''Polish a bracket on a single branch with a guarded secant iteration.
 
     The bracket is formed from two neighbouring scan points whose populations
@@ -226,9 +226,15 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             except cdft.ConvergenceError:
                 continue
         if state is None:
+            if emit is not None:
+                emit('  REFINE lambda=%+.12g FAILED (no inner solve converged)'
+                     % clipped)
             break
         density = np.asarray(state.make_rdm1())
         population = population_of(density)
+        if emit is not None:
+            emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g'
+                 % (clipped, population, population-target))
         if abs(population-target) <= population_tol:
             energy = float(state.e_tot-clipped*population)
             fingerprint = _fingerprint(state, density, population, overlap,
@@ -456,7 +462,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         # same branch; only if that fails is the scan declared unsuccessful.
         refined = _refine(converged_points, target, population_tol, inner_solve,
                           density_tol, lambda d: constraint.population(d),
-                          overlap, eigvals, eigvecs, max_iterations)
+                          overlap, eigvals, eigvecs, max_iterations, emit)
         if refined is not None:
             multiplier, population, energy, state, fingerprint, dens = refined
             root = multiplier
