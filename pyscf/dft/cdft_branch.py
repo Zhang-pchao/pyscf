@@ -577,6 +577,9 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     # that produced five identical rejections in a row and the refinement
     # spun until the child process was killed.
     rejected_multipliers = []
+    # Whether a confirmed fold has already shown that the target lies in a
+    # structural gap. When it has, the refinement stops immediately.
+    structural_gap = False
     for _ in range(max_iterations):
         denominator = right_pop-left_pop
         if abs(denominator) < 1e-14:
@@ -705,7 +708,25 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                     emit('  FOLD CONFIRMED at lambda=%+.12g: the response is '
                          'multivalued, the branches reach %.9f and %.9f'
                          % (clipped, fold['limits'][0], fold['limits'][1]))
+                # A confirmed fold whose two limits straddle the target is a
+                # structural gap, and no further refinement can reach the
+                # target: the response does not take the intermediate values.
+                # The iteration therefore stops at once and reports the gap,
+                # instead of bisecting towards a root that provably does not
+                # exist.
+                fold_lower, fold_upper = fold['limits']
+                if fold_lower < target < fold_upper:
+                    structural_gap = True
+                    if emit is not None:
+                        emit('  STRUCTURAL GAP: the target %.9g lies between '
+                             'the branch limits %.9f and %.9f; the refinement '
+                             'stops without a root' % (target, fold_lower,
+                                                      fold_upper))
             discontinuity_evidence.append(evidence)
+        if structural_gap:
+            # The evidence for the gap is complete. The refinement ends here,
+            # and the caller turns the evidence into a BranchGapError.
+            return None, discontinuity_evidence
         crossed = (trial_fingerprint.density_overlap < density_tol)
         identity_changed = False
         if not crossed and not discontinuity and bracket_identity is not None:
