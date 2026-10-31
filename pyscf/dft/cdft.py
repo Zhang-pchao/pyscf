@@ -37,6 +37,12 @@ class ConvergenceError(RuntimeError):
     '''An inner SCF or the population constraint did not converge.'''
 
 
+# Diagnostics of the most recent branch scan. The branch-aware solver in
+# cdft_branch fills this in on every failure so that a constrained solve that
+# cannot reach its target stays diagnosable after the fact.
+LAST_BRANCH_SCAN = None
+
+
 def atomic_references(mol):
     '''Neutral spherical atomic-HF densities in the molecular spherical basis.
 

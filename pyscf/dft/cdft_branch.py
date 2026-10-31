@@ -107,6 +107,12 @@ def _fingerprint(method, density, population, overlap, eigvals, eigvecs, previou
     overlap_prev = 0.0
     if previous is not None:
         prev = np.asarray(previous)
+        # The caller passes the raw make_rdm1() array, which is 3D for a UKS
+        # state. Reduce it to the same total-density representation that is
+        # used for the current state, otherwise the shape comparison below
+        # never matches and the overlap is silently reported as zero.
+        if prev.ndim == 3:
+            prev = prev.sum(axis=0)
         if prev.shape == dm_sum.shape:
             # Physical overlap of two densities: Tr(S D1 D2), normalised by
             # the self-overlaps. The raw AO trace Tr(D1 D2) is not usable here
@@ -211,7 +217,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                        scan_points=17, density_tol=0.5,
                        scan_mode='uniform', scan_log=None, scan_upper=None,
                        required_signed_spin=None, required_atom_spins=None,
-                       spin_tol=0.2, refine=True):
+                       spin_tol=0.2, refine=True, scf_tol_grad=None):
     '''Solve one constrained UKS state with an explicit branch-aware scan.
 
     The multiplier axis is sampled on a fixed grid. Each grid point runs one
@@ -226,7 +232,9 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             is how a branch switch is detected.
         scan_mode: ``'uniform'`` samples the axis uniformly; ``'log'`` samples
             logarithmically towards zero.
-        scan_log: optional list that receives a human readable scan log.
+        scan_log: optional scan log sink. Either a list that is filled in
+            place, or a callable that is called with each record as it is
+            produced, so that a long scan stays observable.
         scan_upper: optional tighter bound on |lambda| for the scan axis.
         required_signed_spin: optional signed total spin that the accepted root
             must reproduce within ``spin_tol``.
@@ -234,6 +242,13 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             spin that atom must carry.
         refine: when true, the accepted grid root is polished with a local
             secant refinement that stays on the same branch.
+        scf_tol_grad: optional explicit orbital-gradient tolerance for the
+            inner SCF. It is deliberately separate from ``population_tol``:
+            the latter bounds the constraint residual in electrons, the
+            former bounds the inner SCF in an orbital gradient. Reusing one
+            for the other silently drives the inner solve to an unreachable
+            tolerance, because the auxiliary-space tolerance is the square of
+            the gradient tolerance.
 
     Returns:
         A :class:`pyscf.dft.cdft.Result`. The instance additionally carries
@@ -274,10 +289,30 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     axis = _scan_axis(bound, scan_points, scan_mode)
     points = []
     switches = []
-    log = [] if scan_log is None else scan_log
+    # The scan log may be a list that is filled in place, or a callable that
+    # is called for every record. A callable lets a caller stream the log
+    # while the scan is still running. In both cases the records are also
+    # kept in an internal list, so that the completed scan can always report
+    # its own log.
+    records = []
+    if scan_log is None:
+        def emit(message):
+            records.append(message)
+    elif callable(scan_log):
+        def emit(message):
+            records.append(message)
+            scan_log(message)
+    else:
+        def emit(message):
+            records.append(message)
+            scan_log.append(message)
 
     mf = method.copy()
-    mf.conv_tol_grad = min(limit*.1, population_tol)
+    # The inner SCF gradient tolerance is independent of the constraint
+    # residual tolerance. It defaults to the method's own limit, and never
+    # to population_tol, which lives on a different scale entirely.
+    inner_grad_tol = limit*.1 if scf_tol_grad is None else float(scf_tol_grad)
+    mf.conv_tol_grad = inner_grad_tol
     mf.grids = method.grids.copy()
     mf.chkfile = None
     hcore = method.get_hcore()
@@ -295,7 +330,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         '''Run one fully converged inner UKS at a fixed multiplier.'''
         nonlocal mf
         local = method.copy()
-        local.conv_tol_grad = min(limit*.1, population_tol)
+        local.conv_tol_grad = inner_grad_tol
         local.grids = method.grids.copy()
         local.chkfile = None
         local.get_hcore = lambda mol=None: hcore+multiplier*constraint.matrix
@@ -324,7 +359,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         except cdft.ConvergenceError as error:
             points.append({'multiplier_hartree': multiplier, 'converged': False,
                            'error': str(error)})
-            log.append('lambda=%+.12g FAILED (%s)' % (multiplier, error))
+            emit('lambda=%+.12g FAILED (%s)' % (multiplier, error))
             # A failed point breaks the warm-start chain. Continue from the
             # last good density so the scan can still cover the axis.
             continue
@@ -340,9 +375,9 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                  'orbital_residual': residual,
                  'fingerprint': fingerprint.as_dict()}
         points.append(entry)
-        log.append('lambda=%+.12g C=%+.12g residual=%+.6g <S^2>=%.6f overlap=%.6f'
-                   % (multiplier, population, population-target,
-                      fingerprint.spin_square, fingerprint.density_overlap))
+        emit('lambda=%+.12g C=%+.12g residual=%+.6g <S^2>=%.6f overlap=%.6f'
+             % (multiplier, population, population-target,
+                fingerprint.spin_square, fingerprint.density_overlap))
         if previous_fingerprint is not None and fingerprint.density_overlap < density_tol:
             switches.append({
                 'multiplier_hartree': multiplier,
@@ -351,9 +386,9 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                 'density_overlap': fingerprint.density_overlap,
                 'population_jump': population-previous_fingerprint.population,
                 'reason': 'density overlap below threshold'})
-            log.append('  BRANCH SWITCH at lambda=%+.12g overlap=%.6g dC=%+.6g'
-                       % (multiplier, fingerprint.density_overlap,
-                          population-previous_fingerprint.population))
+            emit('  BRANCH SWITCH at lambda=%+.12g overlap=%.6g dC=%+.6g'
+                 % (multiplier, fingerprint.density_overlap,
+                    population-previous_fingerprint.population))
         # Advance the warm-start chain with the density that was actually
         # accepted, so that the next point continues the same branch.
         density = new_density
@@ -365,7 +400,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     if not converged_points:
         reason = 'no multiplier in the scan produced a converged UKS state'
         cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
-                                 'points': points, 'switches': switches}
+                                 'points': points, 'switches': switches,
+                                 'log': list(records)}
         raise cdft.ConvergenceError(
             'Branch scan found no converged constrained state: %s' % reason)
 
@@ -400,7 +436,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                       '%.6g at lambda=%+.12g'
                       % (abs(closest[1]-target), closest[0]))
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
-                                     'points': points, 'switches': switches}
+                                     'points': points, 'switches': switches,
+                                     'log': list(records)}
             raise BranchSwitchError(
                 'Branch scan did not reach the population target: %s' % reason)
 
@@ -416,7 +453,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             reason = ('accepted root has signed spin %.6g, required %.6g'
                       % (fingerprint.signed_spin, required_signed_spin))
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
-                                     'points': points, 'switches': switches}
+                                     'points': points, 'switches': switches,
+                                     'log': list(records)}
             raise cdft.ConvergenceError('Branch identity check failed: %s' % reason)
     if required_atom_spins:
         for atom_index, expected in required_atom_spins.items():
@@ -427,7 +465,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                 reason = ('atom %d carries signed spin %.6g, required %.6g'
                           % (atom_index, observed, expected))
                 cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
-                                         'points': points, 'switches': switches}
+                                         'points': points, 'switches': switches,
+                                         'log': list(records)}
                 raise cdft.ConvergenceError('Branch identity check failed: %s' % reason)
 
     scan = BranchScan(converged=True, root=root, population=population,

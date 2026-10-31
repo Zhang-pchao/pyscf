@@ -134,6 +134,21 @@ class BranchAwareScan(unittest.TestCase):
         self.assertTrue(any(p.get('converged') for p in scan.points))
         self.assertTrue(log)
 
+    def test_scan_log_accepts_a_callable_sink(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        # A caller may pass a callable so that the log is streamed while the
+        # scan is still running. The solver must call it, not try to append
+        # to it.
+        streamed = []
+        result = cdft_branch.solve_branch_aware(
+            mf, w, .4, scan_points=9, scan_log=streamed.append,
+            scan_upper=.5)
+        self.assertLess(abs(result.population-.4), 1e-8)
+        self.assertTrue(streamed)
+        self.assertTrue(any('lambda=' in message for message in streamed))
+
     def test_scan_reports_failure_without_opaque_root_error(self):
         xyz = np.array([[0., 0., -.5], [0, 0., .5]])
         mf = setup(xyz)
@@ -160,6 +175,28 @@ class BranchAwareScan(unittest.TestCase):
                                           eigvecs, None)
         self.assertEqual(first.intrinsic(), second.intrinsic())
         self.assertAlmostEqual(first.spin_square, second.spin_square, 12)
+
+    def test_density_overlap_is_computed_for_a_3d_density(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        result = cdft.solve(mf, w, .4)
+        overlap = result.method.get_ovlp()
+        eigvals, eigvecs = np.linalg.eigh(overlap)
+        # A UKS make_rdm1() returns a 3D array. The fingerprint must reduce
+        # it the same way for the current and for the previous state, so
+        # that the density overlap is a real number instead of a silent zero.
+        previous = np.asarray(result.density)
+        self.assertEqual(previous.ndim, 3)
+        fingerprint = cdft_branch._fingerprint(result.method, result.density,
+                                                result.population, overlap,
+                                                eigvals, eigvecs, previous)
+        self.assertGreater(fingerprint.density_overlap, 0.9)
+        # A state compared against itself must overlap completely.
+        identical = cdft_branch._fingerprint(result.method, result.density,
+                                              result.population, overlap,
+                                              eigvals, eigvecs, result.density)
+        self.assertAlmostEqual(identical.density_overlap, 1.0, 8)
 
     def test_branch_identity_check_rejects_a_wrong_state(self):
         xyz = np.array([[0., 0., -.5], [0, 0., .5]])
