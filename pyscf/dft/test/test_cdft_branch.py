@@ -47,6 +47,22 @@ def setup(coords):
     return mf
 
 
+class FakeMol:
+    '''A minimal stand-in for a PySCF molecule.
+
+    The refinement helper builds a branch fingerprint for every trial, and the
+    fingerprint needs the atom slices to report per-atom spins. The synthetic
+    states in the refinement tests therefore need a molecule-like object.
+    '''
+
+    def __init__(self, natm):
+        self.natm = natm
+
+    def aoslice_by_atom(self):
+        # One basis function per atom keeps the slice map trivial.
+        return [(i, i, i, i+1) for i in range(self.natm)]
+
+
 class GradientAssembly(unittest.TestCase):
     '''The constraint contribution must appear exactly once in the gradient.'''
 
@@ -169,6 +185,7 @@ class BranchAwareScan(unittest.TestCase):
             def __init__(self, population):
                 self.e_tot = -1.0
                 self._population = population
+                self.mol = FakeMol(1)
 
             def make_rdm1(self):
                 # A UKS state carries two spin blocks.
@@ -188,7 +205,7 @@ class BranchAwareScan(unittest.TestCase):
         # Two bracket points straddling the target 0.4.
         points = [(-1.0, 0.3, 0.0, None, None, np.array([[[0.3]]])),
                   (1.0, 0.5, 0.0, None, None, np.array([[[0.5]]]))]
-        refined = cdft_branch._refine(
+        refined, _evidence = cdft_branch._refine(
             points, 0.4, 1e-8, inner_solve, 0.5, population_of,
             np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
             max_iterations=20)
@@ -269,7 +286,8 @@ class BranchAwareScan(unittest.TestCase):
         self.assertIn('branches', scan)
         self.assertTrue(scan['branches'])
         for cluster in scan['branches']:
-            self.assertIn('signed_spin', cluster)
+            self.assertIn('total_spin', cluster)
+            self.assertIn('spin_square', cluster)
             self.assertIn('multiplier_range', cluster)
         self.assertIn('rejected_by_branch', scan)
 
@@ -279,7 +297,7 @@ class BranchFiltering(unittest.TestCase):
 
     def test_branch_mismatch_reports_the_first_violation(self):
         fingerprint = cdft_branch.BranchFingerprint(
-            spin_square=2.0, signed_spin=1.0, atom_spins=(0.5, -0.5),
+            spin_square=2.0, total_spin=1.0, atom_spins=(0.5, -0.5),
             population=1.0)
         self.assertIsNone(cdft_branch._branch_mismatch(fingerprint, None, None,
                                                        0.2))
@@ -294,21 +312,21 @@ class BranchFiltering(unittest.TestCase):
         self.assertIsNotNone(cdft_branch._branch_mismatch(
             fingerprint, None, {7: 1.0}, 0.2))
 
-    def test_branch_summary_clusters_by_signed_spin(self):
-        def point(multiplier, signed_spin):
+    def test_branch_summary_clusters_by_total_spin(self):
+        def point(multiplier, total_spin):
             fingerprint = cdft_branch.BranchFingerprint(
-                spin_square=signed_spin, signed_spin=signed_spin,
-                atom_spins=(signed_spin,), population=multiplier)
+                spin_square=total_spin, total_spin=total_spin,
+                atom_spins=(total_spin,), population=multiplier)
             return (multiplier, multiplier, 0., None, fingerprint,
                     np.zeros((1, 1, 1)))
         clusters = cdft_branch._branch_summary([point(-1., 1.), point(-0.5, 1.),
                                                 point(0.5, 3.)])
         self.assertEqual(len(clusters), 2)
-        self.assertAlmostEqual(clusters[0]['signed_spin'], 1.)
+        self.assertAlmostEqual(clusters[0]['total_spin'], 1.)
         self.assertEqual(clusters[0]['n_points'], 2)
         self.assertAlmostEqual(clusters[0]['multiplier_range'][0], -1.)
         self.assertAlmostEqual(clusters[0]['multiplier_range'][1], -0.5)
-        self.assertAlmostEqual(clusters[1]['signed_spin'], 3.)
+        self.assertAlmostEqual(clusters[1]['total_spin'], 3.)
         self.assertEqual(clusters[1]['n_points'], 1)
 
     def test_required_identity_selects_the_matching_branch(self):
@@ -320,15 +338,15 @@ class BranchFiltering(unittest.TestCase):
         w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
         reference = cdft_branch.solve_branch_aware(mf, w, .4, scan_points=9,
                                                     scan_upper=.5)
-        signed_spin = reference.branch_scan.points[0]['fingerprint']['signed_spin']
+        total_spin = reference.branch_scan.points[0]['fingerprint']['total_spin']
         # Requiring the identity that the scan actually produced must still
         # converge, and the accepted root must carry it.
         accepted = cdft_branch.solve_branch_aware(
             mf, w, .4, scan_points=9, scan_upper=.5,
-            required_signed_spin=signed_spin)
+            required_signed_spin=total_spin)
         self.assertLess(abs(accepted.population-.4), 1e-8)
         self.assertAlmostEqual(accepted.branch_scan.points[-1]['fingerprint']
-                               ['signed_spin'], signed_spin, 6)
+                               ['total_spin'], total_spin, 6)
         self.assertTrue(hasattr(accepted, 'branch_clusters'))
 
     def test_refinement_rejects_a_trial_on_the_wrong_branch(self):
@@ -341,6 +359,7 @@ class BranchFiltering(unittest.TestCase):
                 self.e_tot = -1.0
                 self._population = population
                 self._signed_spin = signed_spin
+                self.mol = FakeMol(1)
 
             def make_rdm1(self):
                 return np.array([np.array([[self._population]]),
@@ -360,7 +379,7 @@ class BranchFiltering(unittest.TestCase):
         def branch_check(fingerprint):
             return 'wrong branch'
 
-        refined = cdft_branch._refine(
+        refined, _evidence = cdft_branch._refine(
             points, 0.4, 1e-8, inner_solve, 0.5, population_of,
             np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
             max_iterations=20, branch_check=branch_check)
@@ -374,6 +393,7 @@ class BranchFiltering(unittest.TestCase):
             def __init__(self, population):
                 self.e_tot = -1.0
                 self._population = population
+                self.mol = FakeMol(1)
 
             def make_rdm1(self):
                 return np.array([np.array([[self._population]]),
@@ -385,10 +405,10 @@ class BranchFiltering(unittest.TestCase):
         def population_of(density):
             return float(density[0][0][0]+density[1][0][0])
 
-        def fingerprint(signed_spin):
+        def fingerprint(total_spin):
             return cdft_branch.BranchFingerprint(
-                spin_square=signed_spin, signed_spin=signed_spin,
-                atom_spins=(signed_spin,), population=0.0)
+                spin_square=total_spin, total_spin=total_spin,
+                atom_spins=(total_spin,), population=0.0)
 
         # The straddling pair is (-1.0, 0.3) and (1.0, 0.5). Only the second
         # one satisfies the required identity, so no bracket may be formed.
@@ -396,11 +416,11 @@ class BranchFiltering(unittest.TestCase):
                    np.array([[[0.3]]])),
                   (1.0, 0.5, 0.0, None, fingerprint(1.0),
                    np.array([[[0.5]]]))]
-        refined = cdft_branch._refine(
+        refined, _evidence = cdft_branch._refine(
             points, 0.4, 1e-8, inner_solve, 0.5, population_of,
             np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
             max_iterations=20,
-            branch_check=lambda fp: None if fp.signed_spin == 1.0 else 'wrong')
+            branch_check=lambda fp: None if fp.total_spin == 1.0 else 'wrong')
         self.assertIsNone(refined)
 
     def test_refinement_rejects_a_trial_that_crosses_a_branch_boundary(self):
@@ -414,6 +434,7 @@ class BranchFiltering(unittest.TestCase):
             def __init__(self, population):
                 self.e_tot = -1.0
                 self._population = population
+                self.mol = FakeMol(1)
 
             def make_rdm1(self):
                 return np.array([np.array([[self._population]]),
@@ -430,7 +451,7 @@ class BranchFiltering(unittest.TestCase):
 
         def fingerprint(population):
             return cdft_branch.BranchFingerprint(
-                spin_square=2.0, signed_spin=1.0, atom_spins=(1.0,),
+                spin_square=2.0, total_spin=1.0, atom_spins=(1.0,),
                 population=population, density_overlap=0.1)
 
         points = [(-1.0, 0.3, 0.0, None, fingerprint(0.3), np.array([[[0.3]]])),
@@ -442,13 +463,468 @@ class BranchFiltering(unittest.TestCase):
         try:
             cdft_branch._fingerprint = (lambda *args, **kwargs:
                                         fingerprint(0.4))
-            refined = cdft_branch._refine(
+            refined, _evidence = cdft_branch._refine(
                 points, 0.4, 1e-8, inner_solve, 0.5, population_of,
                 np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
                 max_iterations=20)
         finally:
             cdft_branch._fingerprint = original
         self.assertIsNone(refined)
+
+    def test_refinement_reports_an_identity_drift_without_rejecting_the_trial(self):
+        # A trial can stay on the same density branch, with a high overlap,
+        # and still move the electronic hole to another fragment. The
+        # population then jumps by a fraction of an electron and the secant
+        # step oscillates across the discontinuity. The SAI0 campaigns showed
+        # exactly this: the overlap stayed near 0.99 while the population
+        # jumped between 14.056 and 13.914.
+        #
+        # The identity must therefore *not* be a rejection criterion. The
+        # fragment spin distribution drifts continuously along one and the
+        # same branch: on the V2-04c D1 case the donor spin grew from 0.003
+        # to 0.337 electrons while the multiplier ran from 0 to 0.03, and
+        # the jump across the fold was only 0.079 electrons. No fixed
+        # threshold separates the drift from the jump, so a threshold based
+        # rejection rejects valid trials and makes the refinement spin.
+        #
+        # The identity is recorded and reported instead, and the rejection
+        # is decided by the response itself.
+        calls = {'count': 0}
+
+        class FakeState:
+            def __init__(self, population, donor_spin):
+                self.e_tot = -1.0
+                self._population = population
+                self._donor_spin = donor_spin
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def inner_solve(multiplier, start_density):
+            calls['count'] += 1
+            # The first trial is on the donor branch, the second one has the
+            # hole on the acceptor.
+            donor_spin = 0.97 if calls['count'] == 1 else -1.93
+            return FakeState(0.4+0.1*multiplier, donor_spin), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        donor = cdft_branch.BranchFingerprint(
+            spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 0.97),), population=0.3)
+        points = [(-1.0, 0.3, 0.0, None, donor, np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, donor, np.array([[[0.5]]]))]
+
+        def patched(*args, **kwargs):
+            # The trial is on the acceptor branch, but its density overlap is
+            # high, so only the identity guard could reject it.
+            return cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                fragment_spins=(('donor', -1.93),), population=0.4,
+                density_overlap=0.99)
+
+        original = cdft_branch._fingerprint
+        try:
+            cdft_branch._fingerprint = patched
+            refined, _evidence = cdft_branch._refine(
+                points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+                np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+                max_iterations=20)
+        finally:
+            cdft_branch._fingerprint = original
+        # The identity drift does not reject the trial. The population of the
+        # trial is inside the tolerance, so the refinement returns it.
+        self.assertIsNotNone(refined)
+
+    def test_the_multivaluedness_probe_requires_two_different_solutions(self):
+        # The strict test of a fold: at one multiplier, two different warm
+        # starts must converge to two different self-consistent solutions.
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        def solve_with(start_population, other_population):
+            def inner_solve(multiplier, start_density):
+                # The warm start decides which of the two solutions is
+                # returned, which is the mechanism of a fold.
+                chosen = start_population if start_density is not None \
+                    and float(start_density[0][0][0]) < 0.4 else other_population
+                return FakeState(chosen), 0.0
+            return inner_solve
+
+        left = np.array([[[0.3]]])
+        right = np.array([[[0.5]]])
+        # The two warm starts reach two different solutions.
+        fold = cdft_branch._probe_multivalued(
+            0.0, left, right, solve_with(0.3, 0.5), population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]))
+        self.assertIsNotNone(fold)
+        self.assertAlmostEqual(fold['separation_electrons'], 0.2, 12)
+        self.assertEqual(len(fold['limits']), 2)
+        # When both warm starts reach the same solution the response is
+        # single valued and no fold is reported.
+        single = cdft_branch._probe_multivalued(
+            0.0, left, right, solve_with(0.3, 0.3), population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]))
+        self.assertIsNone(single)
+
+    def test_a_confirmed_fold_reports_the_two_branch_limits(self):
+        # The gap report must use the two limits that the two branches
+        # actually reach, not the coarse scan bracket. On the V2-04c D1 case
+        # the coarse bracket spans 14.173 and 12.259, which hides the gap
+        # around the target 14.0 completely, while the observed limits
+        # 14.0528 and 13.9145 bracket it.
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.01, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(-0.125, 14.309), point(0.125, 12.259)]
+        evidence = [{'multiplier_hartree': 0.0235858,
+                     'population': 13.9145,
+                     'bracket_prediction': 14.0525,
+                     'anomaly_electrons': 0.138,
+                     'multivalued_confirmed': True,
+                     'fold': {'limits': [13.9145, 14.0525],
+                              'separation_electrons': 0.138}}]
+        gap = cdft_branch._branch_gap(points, 14.0, evidence)
+        self.assertIsNotNone(gap)
+        self.assertIn('separated by', gap)
+        # A target outside the two limits is not in the gap.
+        self.assertIsNone(cdft_branch._branch_gap(points, 14.1, evidence))
+        # A target that the coarse bracket would have hidden is found,
+        # because the limits are the observed ones.
+        self.assertIsNone(cdft_branch._branch_gap(points, 14.2, evidence))
+
+    def test_the_refinement_never_repeats_a_rejected_multiplier(self):
+        # The bisection of an unchanged bracket is a fixed point. When a
+        # trial is rejected the bracket must shrink, or the refinement
+        # recomputes the same rejected multiplier for ever. On the V2-04c D1
+        # case that produced five identical rejections in a row and the
+        # refinement spun until the child process was killed.
+        seen = []
+
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def inner_solve(multiplier, start_density):
+            seen.append(float(multiplier))
+            # Every trial lands on the wrong branch, so every trial is
+            # rejected by the population anomaly test.
+            return FakeState(0.9), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        donor = cdft_branch.BranchFingerprint(
+            spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 1.0),), population=0.3)
+        points = [(-1.0, 0.3, 0.0, None, donor, np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, donor, np.array([[[0.5]]]))]
+
+        original = cdft_branch._fingerprint
+        probe = cdft_branch._probe_multivalued
+        try:
+            cdft_branch._fingerprint = (lambda *args, **kwargs:
+                                        cdft_branch.BranchFingerprint(
+                                            spin_square=2.0, total_spin=2.0,
+                                            atom_spins=(2.0,),
+                                            fragment_spins=(('donor', 1.0),),
+                                            population=0.4, density_overlap=0.99))
+            # The multivaluedness probe is switched off here, because it
+            # solves the same multiplier twice on purpose. The behaviour
+            # under test is the bisection, which must not return to a
+            # multiplier that was already rejected.
+            cdft_branch._probe_multivalued = (lambda *args, **kwargs: None)
+            refined, _evidence = cdft_branch._refine(
+                points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+                np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+                max_iterations=20)
+        finally:
+            cdft_branch._fingerprint = original
+            cdft_branch._probe_multivalued = probe
+        self.assertIsNone(refined)
+        # No multiplier was tried twice.
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_same_branch_compares_the_electronic_identity(self):
+        first = cdft_branch.BranchFingerprint(
+            spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 0.97),), population=14.0)
+        same = cdft_branch.BranchFingerprint(
+            spin_square=2.01, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 0.98),), population=13.9)
+        other = cdft_branch.BranchFingerprint(
+            spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', -1.93),), population=13.9)
+        self.assertTrue(cdft_branch._same_branch(first, same, 0.2))
+        self.assertFalse(cdft_branch._same_branch(first, other, 0.2))
+
+
+class PhysicalFingerprint(unittest.TestCase):
+    '''The branch fingerprint must report physical observables.
+
+    An earlier implementation reported ``Tr(spin_dm @ S^(1/2))`` as the total
+    spin and the raw Loewdin diagonal as the atomic spins. The first is not
+    the total spin and is not bounded by the electron count, and the second is
+    a per basis function quantity. A branch identity built on those numbers
+    could accept a state whose reported spin was physically impossible, which
+    is exactly what the SAI0 campaigns observed.
+    '''
+
+    def test_total_spin_reproduces_the_electron_spin_imbalance(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        result = cdft.solve(mf, w, .4)
+        overlap = result.method.get_ovlp()
+        eigvals, eigvecs = np.linalg.eigh(overlap)
+        fingerprint = cdft_branch._fingerprint(result.method, result.density,
+                                                result.population, overlap,
+                                                eigvals, eigvecs, None)
+        # The total spin must be N_alpha - N_beta, not a Loewdin-contraction
+        # artefact. It can never exceed the electron count.
+        expected = result.method.mol.nelec[0]-result.method.mol.nelec[1]
+        self.assertAlmostEqual(fingerprint.total_spin, expected, 8)
+        self.assertLessEqual(abs(fingerprint.total_spin), result.method.mol.nelectron)
+
+    def test_atom_spins_are_per_atom_and_sum_to_the_total_spin(self):
+        # A basis with more functions than atoms is required, because the
+        # assertion that the atomic spins are per atom and not per basis
+        # function is only meaningful when those counts differ.
+        mol = gto.M(atom=[('H', (0., 0., 0.)), ('H', (0., 0., 1.4))],
+                    basis='6-31g', charge=1, spin=1, verbose=0)
+        mf = dft.UKS(mol)
+        mf.xc = 'pbe0'
+        mf.grids.level = 1
+        mf.grids.prune = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-7
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        result = cdft_branch.solve_branch_aware(mf, w, .4, scan_points=9,
+                                                scan_upper=.5)
+        overlap = result.method.get_ovlp()
+        eigvals, eigvecs = np.linalg.eigh(overlap)
+        fingerprint = cdft_branch._fingerprint(result.method, result.density,
+                                                result.population, overlap,
+                                                eigvals, eigvecs, None)
+        # One entry per atom, not per basis function.
+        self.assertEqual(len(fingerprint.atom_spins), mf.mol.natm)
+        self.assertLess(len(fingerprint.atom_spins), mf.mol.nao)
+        # The atomic spins must sum to the total spin.
+        self.assertAlmostEqual(sum(fingerprint.atom_spins),
+                               fingerprint.total_spin, 8)
+
+    def test_fragment_spins_are_reported_from_the_constraint_weights(self):
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        result = cdft.solve(mf, w, .4)
+        overlap = result.method.get_ovlp()
+        eigvals, eigvecs = np.linalg.eigh(overlap)
+        fingerprint = cdft_branch._fingerprint(
+            result.method, result.density, result.population, overlap,
+            eigvals, eigvecs, None,
+            fragment_weights={'donor': [1., 0.], 'acceptor': [0., -1.]})
+        self.assertEqual([name for name, _ in fingerprint.fragment_spins],
+                         ['donor', 'acceptor'])
+        # The fragment spin is the signed contraction of the atomic spins.
+        donor = dict(fingerprint.fragment_spins)['donor']
+        acceptor = dict(fingerprint.fragment_spins)['acceptor']
+        self.assertAlmostEqual(donor, fingerprint.atom_spins[0], 8)
+        self.assertAlmostEqual(acceptor, -fingerprint.atom_spins[1], 8)
+
+    def test_branch_summary_separates_states_with_the_same_total_spin(self):
+        # Two states with the same total spin but a different spin square are
+        # different electronic branches. Clustering them together would hide
+        # the very distinction the branch audit has to make.
+        def point(multiplier, total_spin, spin_square):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=spin_square, total_spin=total_spin,
+                atom_spins=(total_spin,), population=multiplier)
+            return (multiplier, multiplier, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        clusters = cdft_branch._branch_summary(
+            [point(-1., 2., 2.0), point(-0.5, 2., 4.0)])
+        self.assertEqual(len(clusters), 2)
+
+    def test_branch_gap_is_reported_for_an_unreachable_target(self):
+        # Two branches with disjoint population coverage and the target
+        # between them is a structural gap between electronic branches, not
+        # a numerical failure. The evidence is the discontinuity that the
+        # refinement observed on the bracketed branch.
+        def point(multiplier, population, spin_square):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=spin_square, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(-1.0, 14.2, 2.0), point(-0.5, 13.9, 2.0),
+                  point(0.5, 12.1, 4.0), point(1.0, 11.8, 4.0)]
+        # The refinement observed a discontinuity between the two limits of
+        # one branch, 13.9 and 12.1. A target of 13.0 lies strictly between
+        # them and is therefore attained by neither branch.
+        evidence = [{'bracket_populations': [13.9, 12.1],
+                     'multiplier_hartree': 0.0, 'population': 12.1,
+                     'bracket_prediction': 13.9, 'anomaly_electrons': 1.8}]
+        gap = cdft_branch._branch_gap(points, 13.0, evidence)
+        self.assertIsNotNone(gap)
+        # A target that is reached must not be reported as a gap.
+        self.assertIsNone(cdft_branch._branch_gap(points, 14.0, evidence))
+        # A target outside the reachable range is out of range, not a gap.
+        self.assertIsNone(cdft_branch._branch_gap(points, 20.0, evidence))
+        # Without the evidence of a discontinuity there is no gap to report.
+        self.assertIsNone(cdft_branch._branch_gap(points, 13.0))
+
+    def test_a_hole_migration_is_a_branch_switch_even_with_a_high_overlap(self):
+        # The V2-04c D1 case measured a discontinuity of the constrained
+        # population at lambda ~ 0.0236 across which the density overlap
+        # stayed at 0.998, the total spin was identical to 1e-6 and the spin
+        # square differed by 0.001. Only the population jumped, by 0.142
+        # electrons. An identity built on the total spin and the spin square
+        # alone therefore calls that one branch and the discontinuity becomes
+        # invisible.
+        def point(multiplier, population, donor):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0104, total_spin=2.0, atom_spins=(2.0,),
+                fragment_spins=(('donor', donor), ('acceptor', -donor)),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(0.0230, 14.073, 0.048),
+                  point(0.0235, 14.059, 0.056),
+                  point(0.0240, 13.888, 0.153)]
+        # The refinement observed a trial whose population disagreed with the
+        # bracket prediction. The two limits of the discontinuity are the
+        # population that the bracketed branch predicts and the population
+        # that the rejected trial measured. The target 14.0 lies between
+        # them.
+        evidence = [{'bracket_populations': [14.059, 13.888],
+                     'multiplier_hartree': 0.02358, 'population': 13.9145,
+                     'bracket_prediction': 14.0525, 'anomaly_electrons': 0.086,
+                     'density_overlap': 0.998, 'total_spin': 2.0,
+                     'spin_square': 2.0114}]
+        gap = cdft_branch._branch_gap(points, 14.0, evidence)
+        self.assertIsNotNone(gap)
+        self.assertIn('separated by', gap)
+
+    def test_the_branch_identity_tolerance_resolves_a_fragment_redistribution(self):
+        # A redistribution of 0.079 electrons between fragments is a branch
+        # change at a tight identity tolerance, and is not one at the loose
+        # tolerance that the solver uses.
+        first = cdft_branch.BranchFingerprint(
+            spin_square=2.0104, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 0.056), ('acceptor', -1.944)),
+            population=14.059)
+        second = cdft_branch.BranchFingerprint(
+            spin_square=2.0114, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 0.153), ('acceptor', -1.847)),
+            population=13.888)
+        self.assertFalse(cdft_branch._same_branch(first, second, 0.02))
+        self.assertTrue(cdft_branch._same_branch(first, second, 0.2))
+        # The total spin and the spin square alone do not separate them.
+        self.assertAlmostEqual(first.total_spin, second.total_spin, 8)
+        self.assertLess(abs(first.spin_square-second.spin_square), 0.002)
+
+    def test_the_refinement_rejects_a_trial_that_disagrees_with_its_bracket(self):
+        # The refinement must reject a trial whose population disagrees with
+        # the linear interpolation of the bracket, because such a trial is
+        # not on the bracketed branch. This is the criterion that detects a
+        # discontinuity whose density overlap stays high.
+        class FakeMol:
+            def __init__(self, natm):
+                self.natm = natm
+
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        calls = {'count': 0}
+
+        def inner_solve(multiplier, start_density):
+            calls['count'] += 1
+            # Every trial reports a population that disagrees with the
+            # bracket, so the refinement must reject each of them and give
+            # up instead of accepting a root.
+            return FakeState(0.25), 0.0
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        donor = cdft_branch.BranchFingerprint(
+            spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+            fragment_spins=(('donor', 1.0),), population=0.3)
+        points = [(-1.0, 0.3, 0.0, None, donor, np.array([[[0.3]]])),
+                  (1.0, 0.5, 0.0, None, donor, np.array([[[0.5]]]))]
+
+        def patched(*args, **kwargs):
+            return cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                fragment_spins=(('donor', 1.0),), population=0.4,
+                density_overlap=0.99)
+
+        original = cdft_branch._fingerprint
+        try:
+            cdft_branch._fingerprint = patched
+            refined, evidence = cdft_branch._refine(
+                points, 0.4, 1e-8, inner_solve, 0.5, population_of,
+                np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+                max_iterations=20)
+        finally:
+            cdft_branch._fingerprint = original
+        # The trial that disagreed with the bracket was rejected, and the
+        # rejection is recorded as the evidence of a discontinuity.
+        self.assertIsNone(refined)
+        self.assertTrue(evidence)
+        self.assertIn('anomaly_electrons', evidence[0])
+
+    def test_neighbouring_points_on_one_branch_are_not_a_gap(self):
+        # The scan spacing separates neighbouring points on one branch. That
+        # must not be mistaken for a gap between branches.
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(-1., 14.2), point(-0.5, 13.9), point(0.5, 13.6)]
+        self.assertIsNone(cdft_branch._branch_gap(points, 13.75))
+
+    def test_branch_gap_error_is_a_distinct_failure_mode(self):
+        # The gap failure must be distinguishable from a plain branch switch,
+        # so that a physically unreachable target is never reported as a
+        # solver that failed to converge.
+        self.assertTrue(issubclass(cdft_branch.BranchGapError,
+                                   cdft_branch.BranchSwitchError))
+        self.assertTrue(issubclass(cdft_branch.BranchSwitchError,
+                                   cdft.ConvergenceError))
 
 
 if __name__ == '__main__':
