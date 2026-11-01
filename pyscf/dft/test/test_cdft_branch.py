@@ -955,6 +955,54 @@ class PhysicalFingerprint(unittest.TestCase):
         self.assertTrue(issubclass(cdft_branch.BranchSwitchError,
                                    cdft.ConvergenceError))
 
+    def test_spin_square_from_density_matches_the_orbital_route(self):
+        # The density route and the orbital route must agree, because the
+        # density route is what is used when a branch scan refines a density
+        # matrix instead of an orbital set. A disagreement would make the
+        # branch identity depend on how the state was produced.
+        for spin, charge in ((1, 1), (2, 0)):
+            mol = molecule([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]])
+            mf = dft.UKS(mol)
+            mf.spin = spin
+            mf.charge = charge
+            mf.xc = 'pbe0'
+            mf.grids.level = 1
+            mf.grids.prune = None
+            mf.small_rho_cutoff = 0
+            mf.conv_tol = 1e-12
+            mf.conv_tol_grad = 1e-7
+            mf.kernel()
+            density = mf.make_rdm1()
+            overlap = mf.get_ovlp()
+            orbital = float(mf.spin_square()[0])
+            from_density = cdft_branch.spin_square_from_density(
+                density, overlap)
+            self.assertAlmostEqual(from_density, orbital, places=6)
+
+    def test_spin_square_survives_a_missing_orbital_set(self):
+        # A state that was produced as a density matrix has no mo_coeff, and
+        # the orbital route then raises. The fingerprint must still carry a
+        # real spin square rather than a NaN, because a NaN never matches a
+        # tolerance and would silently poison every branch comparison.
+        mol = molecule([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]])
+        mf = dft.UKS(mol)
+        mf.xc = 'pbe0'
+        mf.grids.level = 1
+        mf.grids.prune = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-7
+        mf.kernel()
+        density = mf.make_rdm1()
+        overlap = mf.get_ovlp()
+        eigvals, eigvecs = np.linalg.eigh(overlap)
+        mf.mo_coeff = None
+        fingerprint = cdft_branch._fingerprint(
+            mf, density, 0.0, overlap, eigvals, eigvecs, None)
+        self.assertFalse(np.isnan(fingerprint.spin_square))
+        expected = cdft_branch.spin_square_from_density(density, overlap)
+        self.assertAlmostEqual(fingerprint.spin_square, expected, places=6)
+
 
 if __name__ == '__main__':
     unittest.main()

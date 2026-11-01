@@ -118,6 +118,36 @@ def _lowdin_root(overlap, eigenvalues, eigenvectors):
     return (eigenvectors*np.sqrt(eigenvalues)) @ eigenvectors.T
 
 
+def spin_square_from_density(density, overlap):
+    '''The spin square of a state, computed from its density matrix.
+
+    The formula is the one that ``pyscf.scf.uhf.spin_square`` applies to the
+    occupied orbitals, written in the density matrix instead:
+
+    ``S^2 = 1/2 (n_a + n_b - Tr(D_a S D_b S)) + 1/4 (n_b - n_a)^2``
+
+    The trace term is the exchange integral of the occupied alpha and beta
+    sets, ``<i^a|j^b> <j^b|i^a>`` summed over the occupied orbitals, which
+    the density matrix expresses as ``Tr(D_a S D_b S)``.
+
+    This route is needed when the orbital set is not available, which happens
+    when a branch scan refines a density matrix rather than an orbital set.
+    The state is then perfectly well defined and its spin square is a
+    property of the density alone.
+    '''
+    dm = np.asarray(density)
+    if dm.ndim == 3:
+        dm_alpha, dm_beta = dm[0], dm[1]
+    else:
+        dm_alpha = dm
+        dm_beta = np.zeros_like(dm)
+    n_alpha = float(np.einsum('ij,ji', dm_alpha, overlap))
+    n_beta = float(np.einsum('ij,ji', dm_beta, overlap))
+    exchange = float(np.einsum('ij,ji', dm_alpha @ overlap,
+                               dm_beta @ overlap))
+    return 0.5*(n_alpha+n_beta-exchange)+0.25*(n_beta-n_alpha)**2
+
+
 def _fingerprint(method, density, population, overlap, eigvals, eigvecs, previous,
                  fragment_weights=None):
     '''Build a fingerprint for one converged state.
@@ -148,7 +178,12 @@ def _fingerprint(method, density, population, overlap, eigvals, eigvecs, previou
     try:
         spin_square = float(method.spin_square()[0])
     except Exception:  # pragma: no cover - defensive, solver dependent
-        spin_square = float('nan')
+        # The orbital route is unavailable when the state was refined as a
+        # density matrix rather than as an orbital set. The spin square is
+        # then computed from the density, which is always available. Falling
+        # back to NaN here would silently poison every branch fingerprint,
+        # because a NaN never matches a tolerance.
+        spin_square = spin_square_from_density(dm, overlap)
     root = _lowdin_root(overlap, eigvals, eigvecs)
     # The total spin is the trace of the spin density in the AO metric.
     total_spin = float(np.einsum('ij,ji', spin_dm, overlap))
