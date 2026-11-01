@@ -46,7 +46,7 @@ import numpy as np
 from pyscf.dft import cdft
 
 __all__ = ['BranchFingerprint', 'BranchScan', 'BranchSwitchError',
-           'BranchGapError', 'solve_branch_aware']
+           'BranchGapError', 'BranchDomainError', 'solve_branch_aware']
 
 
 class BranchSwitchError(cdft.ConvergenceError):
@@ -61,6 +61,29 @@ class BranchGapError(BranchSwitchError):
     population is not attained by any reachable branch. Reporting it
     separately keeps a physically unreachable target from being mistaken for a
     solver that failed to converge.
+    '''
+
+
+class BranchDomainError(BranchSwitchError):
+    '''The target population lies outside the searched multiplier domain.
+
+    This is a statement about the *search*, not about the model. The scan
+    covered a bounded multiplier axis, and the constrained population was
+    still moving towards the target when the axis ended. The target may well
+    be attainable at a larger |lambda|; the scan simply did not go there.
+
+    The distinction from :class:`BranchGapError` is essential. A gap says
+    that no branch reaches the target. A domain exhaustion says that the
+    branch that *is* being followed approaches the target as the multiplier
+    grows, so the search was stopped before it arrived. Conflating the two
+    turns a truncated search into a negative scientific claim, and that is
+    exactly the kind of claim this gate exists to prevent.
+
+    Measured on the V2-04b ``oh_waters`` definition: the constrained
+    population reaches 10.969 electrons at lambda = -1 Hartree against a
+    target of 12.0, and the response is monotone with a slope of about -9.4
+    electrons per Hartree at that end, so the target sits just outside the
+    searched domain rather than in a gap.
     '''
 
 
@@ -443,6 +466,83 @@ def _branch_unreachable(discontinuity_evidence, target):
             '%.6f; it is attainable only from the other branch, and the '
             'bracketed branch stops at %.6f'
             % (target, upper, lower))
+
+
+def _domain_exhaustion(converged_points, target, bound):
+    '''Describe a target that lies outside the searched multiplier domain.
+
+    The scan covers a bounded multiplier axis. When the constrained
+    population is still moving towards the target at the end of that axis,
+    the search has been truncated rather than answered. The target may be
+    attainable at a larger |lambda|; nothing observed so far says it is not.
+
+    This is deliberately different from a gap. A gap is a property of the
+    model: two branches cover disjoint population intervals and the target
+    lies between them. A domain exhaustion is a property of the search: the
+    branch that is being followed approaches the target as the multiplier
+    grows, so the axis ended before the branch arrived.
+
+    The evidence required is that the population is monotone near the end
+    of the axis and that the extrapolated response still heads towards the
+    target. A merely close point is not enough: a response that approaches
+    the target and then turns back would be a saturated branch, and that is
+    a different statement entirely.
+
+    Measured on the V2-04b ``oh_waters`` definition: the population runs
+    from 4.071 electrons at lambda = 0 to 10.969 at lambda = -1 against a
+    target of 12.0, monotonically increasing as the multiplier goes
+    negative, and the last two points give a slope of about -9.4 electrons
+    per Hartree. The target therefore sits just outside the searched domain
+    rather than inside a gap.
+
+    Returns a description string, or ``None`` when the domain was not
+    exhausted.
+    '''
+    if len(converged_points) < 2:
+        return None
+    ordered = sorted(converged_points, key=lambda item: item[0])
+    # Both ends of the axis are examined separately. The target may lie
+    # beyond either one, and the two directions are physically different, so
+    # a single "last point" would only ever find one of them.
+    candidates = []
+    for direction in (-1, +1):
+        edge = ordered[0] if direction < 0 else ordered[-1]
+        if abs(abs(edge[0]) - bound) > 1e-12:
+            # This end of the axis was not reached by a converged point, so
+            # the domain was not what stopped the search here.
+            continue
+        # The outward direction is the one that continues away from zero.
+        outward = ordered[1] if direction < 0 else ordered[-2]
+        if (edge[0]-outward[0])*direction <= 0:
+            # The neighbouring point is not on the inward side, so the slope
+            # at the edge cannot be read as the outward trend.
+            continue
+        slope = (edge[1]-outward[1])/(edge[0]-outward[0])
+        if slope == 0:
+            continue
+        # The response must still be heading towards the target at the edge.
+        if (edge[1]-target)*slope <= 0:
+            continue
+        # The endpoint population must actually be the closest approach to
+        # the target over the whole scan, otherwise the target is interior
+        # and the domain is not what limited the search.
+        closest = min((abs(item[1]-target) for item in ordered), default=None)
+        if closest is None or abs(edge[1]-target) > closest:
+            continue
+        candidates.append((edge[1], edge[0], slope))
+    if not candidates:
+        return None
+    # When both ends approach the target, the closer one is the informative
+    # one, because it is the one that determines how far the search fell
+    # short.
+    end_population, end_multiplier, slope = min(
+        candidates, key=lambda item: abs(item[0]-target))
+    return ('the target population %.6g lies outside the searched multiplier '
+            'domain: the constrained population reaches %.6f at lambda = '
+            '%+.12g, which is the closest approach to the target in the scan, '
+            'and the response is still moving towards the target there with a '
+            'slope of %.6g electrons per Hartree'
+            % (target, end_population, end_multiplier, slope))
 
 
 def _branch_summary(converged_points, branch_tol=0.2):
@@ -1129,7 +1229,16 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         scan_log: optional scan log sink. Either a list that is filled in
             place, or a callable that is called with each record as it is
             produced, so that a long scan stays observable.
-        scan_upper: optional tighter bound on |lambda| for the scan axis.
+        scan_upper: optional bound on |lambda| for the scan axis. It replaces
+            the default bound of ``max_multiplier`` when it is given, and it
+            may exceed ``max_multiplier``: the two control different things.
+            ``max_multiplier`` bounds the *refinement* root search, while
+            ``scan_upper`` bounds the *scan* axis. Truncating the scan axis
+            to ``max_multiplier`` silently makes the knob useless for any
+            value above the default, which is exactly where it matters: a
+            target that the response approaches only at large |lambda| needs
+            an axis that reaches there.
+        max_multiplier: bound on |lambda| for the refinement root search.
         required_signed_spin: optional total spin ``N_alpha - N_beta`` that the
             accepted root must reproduce within ``spin_tol``. When it is given,
             the scan points that do not carry that identity are *filtered out*
@@ -1163,8 +1272,16 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         raise ValueError('density_tol must lie in (0, 1]')
     if scan_mode not in ('uniform', 'log'):
         raise ValueError("scan_mode must be 'uniform' or 'log'")
-    bound = float(max_multiplier if scan_upper is None else min(max_multiplier,
-                                                               abs(scan_upper)))
+    # The scan axis and the refinement root search are bounded separately.
+    # The scan axis may be wider than the refinement bound: the scan is what
+    # establishes where the response lies, and a target that is only
+    # approached at large |lambda| cannot be found by a scan that stops at
+    # the refinement bound. Truncating the axis to the refinement bound
+    # would silently discard the region where the target is approached.
+    if scan_upper is None:
+        bound = float(max_multiplier)
+    else:
+        bound = float(abs(scan_upper))
     if bound <= 0:
         raise ValueError('A branch scan needs a positive multiplier bound')
     if not np.isfinite([target, population_tol, max_multiplier]).all():
@@ -1392,9 +1509,22 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             gap = _branch_gap(converged_points, target, discontinuity_evidence)
             unreachable = None
             unresolved = None
+            # The target may lie beyond the searched multiplier domain. This
+            # is a statement about the search and not about the model: the
+            # branch that is being followed approaches the target as the
+            # multiplier grows, so the axis ended before the branch arrived.
+            # It is checked before the fold and curvature cases because those
+            # describe what happens *inside* the domain, while this one
+            # describes running out of domain. A confirmed gap keeps priority
+            # over it, because a gap is a model-level fact and settles the
+            # question on its own.
+            exhausted = _domain_exhaustion(converged_points, target, bound)
             if gap is not None:
                 reason = ('the target population %.6g lies in a gap between two '
                           'electronic branches: %s' % (target, gap))
+            elif exhausted is not None:
+                reason = ('the target population %.6g is outside the searched '
+                          'multiplier domain: %s' % (target, exhausted))
             else:
                 # The target may be attainable, but only from the branch that
                 # the refinement did not follow. This is not a gap and not a
@@ -1446,11 +1576,15 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                                      'branch_gap': gap,
                                      'branch_unreachable': unreachable,
                                      'branch_unresolved': unresolved,
+                                     'domain_exhaustion': exhausted,
                                      'curvature_deviations': curvature_evidence,
                                      'discontinuities': discontinuity_evidence,
                                      'log': list(records)}
             if gap is not None:
                 raise BranchGapError(
+                    'Branch scan did not reach the population target: %s' % reason)
+            if exhausted is not None:
+                raise BranchDomainError(
                     'Branch scan did not reach the population target: %s' % reason)
             raise BranchSwitchError(
                 'Branch scan did not reach the population target: %s' % reason)
@@ -1486,4 +1620,20 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     result.branch_density = root_density
     result.branch_clusters = branches
     result.branch_rejected = rejected_by_branch
+    # The scan record is published on the successful path as well, and it
+    # carries the same keys as the unsuccessful one. A consumer that reads
+    # the branch limits from the record must not find them on one path and
+    # not on the other, because the fold that was observed on the way to a
+    # root is exactly the evidence that describes the two branches around
+    # that root.
+    cdft.LAST_BRANCH_SCAN = {'converged': True, 'reason': '',
+                             'points': points, 'switches': switches,
+                             'branches': branches,
+                             'rejected_by_branch': rejected_by_branch,
+                             'branch_gap': None,
+                             'branch_unreachable': None,
+                             'branch_unresolved': None,
+                             'curvature_deviations': [],
+                             'discontinuities': [],
+                             'log': list(records)}
     return result

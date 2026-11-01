@@ -1223,5 +1223,90 @@ class PhysicalFingerprint(unittest.TestCase):
         self.assertAlmostEqual(fingerprint.spin_square, expected, places=6)
 
 
+class DomainExhaustion(unittest.TestCase):
+    '''A target outside the searched domain must not be reported as a gap.
+
+    The distinction is the one that separates a statement about the model
+    from a statement about the search. A truncated scan says nothing about
+    whether the target exists, and reporting it as an absence would turn a
+    resource decision into a negative scientific claim.
+    '''
+
+    @staticmethod
+    def _points(pairs):
+        # The helper only reads the multiplier and the population of each
+        # converged point, so the synthetic points carry the minimum.
+        return [(multiplier, population, 0.0, None, None, None)
+                for multiplier, population in pairs]
+
+    def test_a_target_approached_at_the_edge_of_the_axis_is_domain_exhaustion(self):
+        # The response rises towards the target as the multiplier goes
+        # negative, and the axis ends while it is still rising. This is the
+        # shape of the V2-04b oh_waters case.
+        points = self._points([(-1.0, 10.969), (-0.875, 9.789),
+                               (0.0, 4.071), (1.0, -6.379)])
+        message = cdft_branch._domain_exhaustion(points, 12.0, 1.0)
+        self.assertIsNotNone(message)
+        self.assertIn('outside the searched multiplier domain', message)
+        self.assertIn('10.969', message)
+
+    def test_a_target_inside_the_axis_is_not_domain_exhaustion(self):
+        # The response covers the target inside the axis, so the domain is
+        # not what limited the search. The interior point is the closest
+        # approach to the target, which is what rules out the domain.
+        points = self._points([(-1.0, 10.969), (-0.75, 12.5),
+                               (0.0, 4.071), (1.0, -6.379)])
+        self.assertIsNone(cdft_branch._domain_exhaustion(points, 12.0, 1.0))
+
+    def test_a_saturated_response_at_the_edge_is_not_domain_exhaustion(self):
+        # The response approaches the target and then turns back. The
+        # branch has saturated, which is a different statement from having
+        # run out of domain.
+        points = self._points([(-1.0, 10.0), (-0.875, 10.5),
+                               (0.0, 8.0), (1.0, -6.379)])
+        self.assertIsNone(cdft_branch._domain_exhaustion(points, 12.0, 1.0))
+
+    def test_a_response_that_moves_away_from_the_target_is_not_domain_exhaustion(self):
+        # At the negative edge the response moves away from the target, so
+        # extending the axis would not help.
+        points = self._points([(-1.0, 2.0), (-0.875, 4.0),
+                               (0.0, 8.0), (1.0, -6.379)])
+        self.assertIsNone(cdft_branch._domain_exhaustion(points, 12.0, 1.0))
+
+    def test_the_closest_approach_must_be_at_the_edge(self):
+        # The target is approached in the interior of the axis and the edge
+        # points are further away, so the domain did not limit the search.
+        points = self._points([(-1.0, 2.0), (-0.875, 11.9),
+                               (0.0, 8.0), (1.0, -6.379)])
+        self.assertIsNone(cdft_branch._domain_exhaustion(points, 12.0, 1.0))
+
+    def test_the_scan_axis_is_not_truncated_by_the_refinement_bound(self):
+        # The scan axis and the refinement bound control different things.
+        # Truncating the axis to the refinement bound makes a wider scan
+        # impossible, which is exactly the case that a target at large
+        # |lambda| needs.
+        axis = cdft_branch._scan_axis(2.0, 17, 'uniform')
+        self.assertAlmostEqual(min(axis), -2.0)
+        self.assertAlmostEqual(max(axis), 2.0)
+
+    def test_a_wider_scan_axis_reaches_the_target(self):
+        # The target sits at a population that the response only attains at
+        # large negative lambda. With the axis bound at the default the scan
+        # cannot reach it; with a wider axis it can.
+        xyz = np.array([[0., 0., -.5], [0, 0., .5]])
+        mf = setup(xyz)
+        w = cdft.Hirshfeld(mf.mol, [1., -1.], mf.grids)
+        # The population of this system is bounded by the electron count, so
+        # the target is chosen inside that bound and the scan is widened
+        # until it is reached.
+        target = 0.4
+        result = cdft_branch.solve_branch_aware(
+            mf, w, target, scan_points=17, scan_upper=2.0)
+        self.assertLess(abs(result.population-target), 1e-8)
+        multipliers = [point['multiplier_hartree']
+                       for point in result.branch_scan.points]
+        self.assertGreater(max(abs(m) for m in multipliers), 1.0)
+
+
 if __name__ == '__main__':
     unittest.main()
