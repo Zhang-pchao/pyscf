@@ -580,6 +580,133 @@ class BranchFiltering(unittest.TestCase):
             np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]))
         self.assertIsNone(single)
 
+    def test_a_curved_response_is_not_taken_for_a_branch_crossing(self):
+        # A trial whose population deviates from the straight line that
+        # connects the two bracket endpoints is not necessarily on another
+        # branch: the response may simply be curved over the bracket.
+        #
+        # The strict test decides. It solves the same multiplier from both
+        # bracket endpoints and compares the two answers. A single valued
+        # response means the trial is on the bracketed branch, and the trial
+        # must be accepted.
+        #
+        # Measured on the V2-04b collective-P case at the 1.21 Angstrom
+        # geometry: the coarse bracket spans the populations 12.2586 at
+        # lambda 0.125 and 10.6907 at lambda 0.25, the target 12.0 is
+        # reached by the response near lambda 0.1456, and every one of the
+        # 34 refinement trials was rejected for deviating from the straight
+        # line that connects the two bracket endpoints. Every deviation had
+        # the same sign and the measured populations along the rejected
+        # trials were monotone, which is the signature of curvature. The
+        # rejection threshold was max(0.05*1.568, 10*0.05) = 0.5
+        # electrons and the deviations were 0.15 to 0.50 electrons, so they
+        # passed the threshold by the very curvature that the threshold was
+        # meant to tolerate. The strict test was run at every one of those
+        # trials and reported a single valued response every time, and the
+        # trials were rejected in spite of the test that had cleared them.
+        # The target was reported as unattainable when the response had in
+        # fact been bracketing it all along.
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        # A curved but single valued response. The population is a smooth
+        # function of the multiplier that passes exactly through the two
+        # bracket endpoints and bows away from the straight line between
+        # them. The bow is the curvature that the linear prediction cannot
+        # represent.
+        x_low, x_high = 0.125, 0.25
+        y_low, y_high = 12.2586, 10.6907
+
+        def curved(multiplier):
+            u = (multiplier-x_low)/(x_high-x_low)
+            return (y_low+(y_high-y_low)*u+2.0*u*(1.0-u))
+
+        def inner_solve(multiplier, start_density):
+            return FakeState(curved(multiplier)), 0.0
+
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.array([[[population]]]))
+
+        points = [point(0.125, 12.2586), point(0.25, 10.6907)]
+        curvature = []
+        refined, evidence = cdft_branch._refine(
+            points, 12.0, 1e-8, inner_solve, 0.5, population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+            max_iterations=40, curvature_sink=curvature)
+        # The target is attained, and the deviation from the bracket
+        # prediction is recorded as curvature rather than as a crossing.
+        self.assertIsNotNone(refined)
+        self.assertAlmostEqual(refined[1], 12.0, delta=1e-8)
+        self.assertEqual(len(evidence), 0)
+        self.assertTrue(curvature)
+        for item in curvature:
+            self.assertFalse(item['multivalued_confirmed'])
+
+    def test_a_confirmed_fold_still_rejects_the_trial(self):
+        # The fix must not weaken the genuine crossing detection. A trial
+        # that lands on another branch is still rejected, and the fold is
+        # still reported with its two limits.
+        class FakeState:
+            def __init__(self, population):
+                self.e_tot = -1.0
+                self._population = population
+                self.mol = FakeMol(1)
+
+            def make_rdm1(self):
+                return np.array([np.array([[self._population]]),
+                                 np.array([[0.0]])])
+
+        def population_of(density):
+            return float(density[0][0][0]+density[1][0][0])
+
+        # The warm start decides which of the two solutions is returned, so
+        # the response is multivalued at every multiplier. The two branch
+        # limits are the populations of the two solutions. The two bracket
+        # endpoints carry the densities 0.3 and 0.5, and the solution that is
+        # returned is selected by which of them the warm start came from.
+        def inner_solve(multiplier, start_density):
+            if start_density is not None \
+                    and abs(float(start_density[0][0][0])-0.3) < 1e-9:
+                return FakeState(12.2586), 0.0
+            return FakeState(10.6907), 0.0
+
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.array([[[0.3 if population > 11.0 else 0.5]]]))
+
+        points = [point(0.125, 12.2586), point(0.25, 10.6907)]
+        curvature = []
+        refined, evidence = cdft_branch._refine(
+            points, 12.0, 1e-8, inner_solve, 0.5, population_of,
+            np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
+            max_iterations=40, curvature_sink=curvature)
+        # The target lies between the two branch limits, so the refinement
+        # reports the gap rather than a root.
+        self.assertIsNone(refined)
+        self.assertTrue(evidence)
+        self.assertTrue(evidence[0]['multivalued_confirmed'])
+        self.assertIn('fold', evidence[0])
+        # The curvature sink stays empty: a confirmed fold is a
+        # discontinuity, not a curvature.
+        self.assertEqual(len(curvature), 0)
+
     def test_a_confirmed_fold_reports_the_two_branch_limits(self):
         # The gap report must use the two limits that the two branches
         # actually reach, not the coarse scan bracket. On the V2-04c D1 case
@@ -894,6 +1021,14 @@ class PhysicalFingerprint(unittest.TestCase):
         # the linear interpolation of the bracket, because such a trial is
         # not on the bracketed branch. This is the criterion that detects a
         # discontinuity whose density overlap stays high.
+        #
+        # The trial in this test reports the population 0.25 while the
+        # bracket spans the populations 0.3 and 0.5, so the trial falls
+        # outside the range of the bracket. A population on the bracketed
+        # branch lies between the two bracket endpoints, because the
+        # constrained population varies monotonically along a branch. The
+        # trial therefore reports a population that the bracketed branch
+        # cannot produce, which is a crossing.
         class FakeMol:
             def __init__(self, natm):
                 self.natm = natm
@@ -933,19 +1068,29 @@ class PhysicalFingerprint(unittest.TestCase):
                 density_overlap=0.99)
 
         original = cdft_branch._fingerprint
+        curvature = []
         try:
             cdft_branch._fingerprint = patched
             refined, evidence = cdft_branch._refine(
                 points, 0.4, 1e-8, inner_solve, 0.5, population_of,
                 np.array([[1.0]]), np.array([1.0]), np.array([[1.0]]),
-                max_iterations=20)
+                max_iterations=20, curvature_sink=curvature)
         finally:
             cdft_branch._fingerprint = original
-        # The trial that disagreed with the bracket was rejected, and the
-        # rejection is recorded as the evidence of a discontinuity.
+        # The trial was rejected: it reported a population that the
+        # bracketed branch cannot produce, so it carries no information about
+        # the bracket.
         self.assertIsNone(refined)
-        self.assertTrue(evidence)
-        self.assertIn('anomaly_electrons', evidence[0])
+        # The rejection is not a discontinuity. The response is single
+        # valued at the trial, so the jump is a numerical artefact of the
+        # warm start rather than a crossing of a branch boundary, and the
+        # gap report must not be built from it.
+        self.assertEqual(len(evidence), 0)
+        self.assertTrue(curvature)
+        for item in curvature:
+            self.assertFalse(item['multivalued_confirmed'])
+            self.assertTrue(item['outside_bracket_range'])
+            self.assertIn('anomaly_electrons', item)
 
     def test_neighbouring_points_on_one_branch_are_not_a_gap(self):
         # The scan spacing separates neighbouring points on one branch. That

@@ -597,7 +597,8 @@ def _probe_multivalued(multiplier, left_density, right_density, inner_solve,
 
 def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             population_of, overlap, eigvals, eigvecs, max_iterations=40, emit=None,
-            branch_check=None, fragment_weights=None, branch_identity_tol=0.2):
+            branch_check=None, fragment_weights=None, branch_identity_tol=0.2,
+            curvature_sink=None):
     '''Polish a bracket on a single branch with a guarded secant iteration.
 
     The bracket is formed from two neighbouring scan points whose populations
@@ -663,6 +664,12 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     # branch must agree with the linear interpolation of the bracket, and a
     # trial that does not agree has crossed into another branch.
     discontinuity_evidence = []
+    # The deviations from the bracket prediction that the strict test
+    # cleared. The response was single valued at those multipliers, so the
+    # deviations are the curvature of the response over the bracket and not
+    # a crossing of a branch boundary. They are reported separately from
+    # the discontinuities, because they carry no information about a gap.
+    curvature_evidence = []
     force_bisect = False
     # The multipliers that were rejected because they crossed a branch
     # boundary. The bisection must not return to them, because the bisection
@@ -768,7 +775,62 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
         anomaly = abs(population-predicted_population)
         bracket_span = abs(right_pop-left_pop)
         crossing_scale = max(0.05*bracket_span, 10.*population_tol)
-        discontinuity = anomaly > crossing_scale
+        # A candidate crossing. The deviation from the straight line that
+        # connects the two bracket endpoints is only evidence, because the
+        # response may be curved over the bracket and a trial that lies on
+        # the same branch then deviates from the line as well.
+        #
+        # The judgement that is intrinsic to the response is the *range*.
+        # The bracket spans the populations of the two scan points on one
+        # branch, and the population of a trial on that branch must lie
+        # between them: the constrained population varies monotonically
+        # along a branch, so a trial that reports a population outside the
+        # interval of the bracket cannot be on it. This criterion does not
+        # depend on the shape of the response at all, and therefore it does
+        # not confuse curvature with a crossing.
+        #
+        # Measured on the V2-04b collective-P case at the 1.21 Angstrom
+        # geometry: the bracket spans the populations 12.2586 and 10.6907
+        # and every rejected trial reported a population of 12.20, 12.05,
+        # 11.98, 11.64, 11.36, 11.31 or 11.12, all of which lie inside the
+        # interval. The trials were on the bracketed branch. The linear
+        # prediction of the bracket was the inaccurate quantity, because the
+        # response is strongly curved over the bracket, and the rejection
+        # threshold was max(0.05*1.568, 10*0.05) = 0.5 electrons against
+        # deviations of 0.15 to 0.50, so the curvature passed the very
+        # threshold that was meant to tolerate it.
+        range_lower = min(left_pop, right_pop)
+        range_upper = max(left_pop, right_pop)
+        # A population that falls outside the interval of the bracket cannot
+        # come from the bracketed branch: the constrained population varies
+        # monotonically along a branch, so every population on the branch is
+        # between the populations of the two endpoints. This is a jump of
+        # the response and not a deviation from the linear prediction, and it
+        # is judged on its own.
+        outside_range = (population < range_lower
+                         or population > range_upper)
+        # The deviation from the straight line that connects the two bracket
+        # endpoints is only evidence, because the response may be curved over
+        # the bracket and a trial that lies on the same branch then deviates
+        # from the line as well. The strict test decides this one.
+        deviation = anomaly > crossing_scale
+        discontinuity = outside_range or deviation
+        # The verdict of the strict test, when it was run. A trial whose
+        # deviation from the bracket prediction is large is only a *candidate*
+        # discontinuity: the response may be strongly curved over the
+        # bracket, in which case a trial that lies on the same branch still
+        # deviates from the straight line that connects the two bracket
+        # endpoints. The strict test decides, and its verdict is final.
+        #
+        # The test does not apply to a population that fell outside the
+        # bracket: that is a jump of the response, and a jump of a single
+        # valued response is a numerical artefact of the warm start rather
+        # than a branch boundary.
+        multivalued_verdict = None
+        # A population that lies outside the bracket of a single valued
+        # response is a numerical artefact of the warm start. The trial is
+        # rejected, but it is not a discontinuity and not a fold.
+        numerical_jump = False
         if discontinuity:
             # A population anomaly is only a *candidate* discontinuity. The
             # population may also jump because the warm start followed the
@@ -783,6 +845,71 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             fold = _probe_multivalued(clipped, left_density, right_density,
                                       inner_solve, population_of, overlap,
                                       eigvals, eigvecs, fragment_weights)
+            multivalued_verdict = 'fold' if fold is not None else 'single_valued'
+            if fold is None and not outside_range:
+                # The strict test found a single valued response at this
+                # multiplier, and the trial reported a population inside the
+                # bracket. The deviation from the bracket prediction is
+                # therefore the curvature of the response over the bracket,
+                # not a crossing of a branch boundary.
+                #
+                # Measured on the V2-04b collective-P case at the 1.21
+                # Angstrom geometry: the coarse bracket spans the
+                # populations 12.2586 and 10.6907, the target 12.0 is
+                # reached by the response near lambda 0.1456, and every one
+                # of the 34 refinement trials was rejected for deviating
+                # from the straight line that connects the two bracket
+                # endpoints. Every deviation had the same sign and the
+                # measured populations along the rejected trials were
+                # monotone, which is the signature of curvature. The
+                # threshold that produced those rejections was
+                # max(0.05*1.568, 10*0.05) = 0.5 electrons, and the
+                # deviations were 0.15 to 0.50 electrons, so they passed the
+                # threshold by the very curvature that the threshold was
+                # meant to tolerate. The strict test was run at every one of
+                # those trials and reported a single valued response every
+                # time. The trials were therefore rejected in spite of the
+                # test that had cleared them, and the target was reported as
+                # unattainable when the response had in fact been bracketing
+                # it all along.
+                #
+                # The verdict of the strict test is final: a single valued
+                # response means the trial is on the bracketed branch, and
+                # the trial is accepted. The deviation is still recorded, so
+                # that the curvature of the response remains visible in the
+                # log.
+                discontinuity = False
+                if emit is not None:
+                    emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g '
+                         '(the population deviates from the bracket prediction '
+                         '%.9g by %.3g, but the response is single valued at '
+                         'this multiplier; the deviation is the curvature of '
+                         'the response over the bracket and the trial is on '
+                         'the bracketed branch)'
+                         % (clipped, population, population-target,
+                            predicted_population, anomaly))
+            elif fold is None and outside_range:
+                # The trial reported a population outside the bracket and the
+                # response is single valued. The jump is a numerical artefact
+                # of the warm start and not a branch boundary. The trial is
+                # nevertheless rejected, because the bracketed branch cannot
+                # produce that population, and the observation is recorded as
+                # a curvature deviation rather than as a discontinuity.
+                #
+                # The rejection is carried by a flag of its own, because the
+                # trial must not be accepted while it is also not a
+                # discontinuity: a single valued response that jumps is a
+                # numerical failure of the warm start, and it must not be
+                # mistaken for a branch crossing either.
+                numerical_jump = True
+                if emit is not None:
+                    emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g '
+                         '(the population %.9g lies outside the bracket range '
+                         '[%.9g, %.9g] and the response is single valued at '
+                         'this multiplier; the jump is a numerical artefact '
+                         'of the warm start and the trial is rejected)'
+                         % (clipped, population, population-target, population,
+                            range_lower, range_upper))
             evidence = {
                 'multiplier_hartree': float(clipped),
                 'population': float(population),
@@ -794,6 +921,8 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 'total_spin': float(trial_fingerprint.total_spin),
                 'spin_square': float(trial_fingerprint.spin_square),
                 'multivalued_confirmed': fold is not None,
+                'outside_bracket_range': bool(outside_range),
+                'bracket_range': [float(range_lower), float(range_upper)],
             }
             if fold is not None:
                 evidence['fold'] = fold
@@ -842,7 +971,18 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                              'upper fold limit %.9f; it is reachable only from '
                              'the other branch, not from this one'
                              % (target, fold_upper))
-            discontinuity_evidence.append(evidence)
+            # A single valued response is not a discontinuity and must not
+            # enter the discontinuity evidence. The evidence is what the
+            # caller turns into a gap report, and a curvature deviation
+            # carries no information about a branch boundary. It is recorded
+            # separately, so that the curvature of the response over the
+            # bracket remains visible.
+            if fold is not None:
+                discontinuity_evidence.append(evidence)
+            else:
+                curvature_evidence.append(evidence)
+                if curvature_sink is not None:
+                    curvature_sink.append(evidence)
         if structural_gap:
             # The evidence for the gap is complete. The refinement ends here,
             # and the caller turns the evidence into a BranchGapError.
@@ -854,7 +994,8 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             return None, discontinuity_evidence
         crossed = (trial_fingerprint.density_overlap < density_tol)
         identity_changed = False
-        if not crossed and not discontinuity and bracket_identity is not None:
+        if (not crossed and not discontinuity and not numerical_jump
+                and bracket_identity is not None):
             # The branch identity is a *diagnostic*, not a rejection
             # criterion. The fragment spin distribution drifts continuously
             # along one and the same branch, so a fixed tolerance cannot
@@ -876,13 +1017,17 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             # The identity is recorded as evidence and reported.
             identity_changed = not _same_branch(trial_fingerprint,
                                                bracket_identity, branch_tol)
-        if crossed or discontinuity:
+        if crossed or discontinuity or numerical_jump:
             if emit is not None:
                 if crossed:
                     emit('  REFINE lambda=%+.12g REJECTED (density overlap %.6g '
                          'below threshold %.6g)'
                          % (clipped, trial_fingerprint.density_overlap,
                             density_tol))
+                elif numerical_jump:
+                    emit('  REFINE lambda=%+.12g REJECTED (the population '
+                         '%.9g lies outside the bracket range [%.9g, %.9g])'
+                         % (clipped, population, range_lower, range_upper))
                 else:
                     emit('  REFINE lambda=%+.12g REJECTED (population %.9g '
                          'disagrees with the bracket prediction %.9g by %.3g)'
@@ -908,7 +1053,8 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             rejected_multipliers.append(clipped)
         else:
             force_bisect = False
-        if not crossed and not discontinuity and branch_check is not None:
+        if (not crossed and not discontinuity and not numerical_jump
+                and branch_check is not None):
             mismatch = branch_check(trial_fingerprint)
             if mismatch is not None:
                 # The trial landed on a different electronic branch. It is
@@ -921,7 +1067,8 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 # that carries the required identity, so the refinement keeps
                 # its bracket and tries a different trial point.
                 break
-        if emit is not None and not crossed and not discontinuity:
+        if (emit is not None and not crossed and not discontinuity
+                and not numerical_jump):
             if identity_changed:
                 # The identity moved, but the population stayed on the
                 # branch. This is a drift, not a crossing, and it is reported
@@ -934,12 +1081,13 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             else:
                 emit('  REFINE lambda=%+.12g C=%+.12g residual=%+.6g'
                      % (clipped, population, population-target))
-        if not crossed and not discontinuity and abs(population-target) <= population_tol:
+        if (not crossed and not discontinuity and not numerical_jump
+                and abs(population-target) <= population_tol):
             energy = float(state.e_tot-clipped*population)
             fingerprint = trial_fingerprint
             return (clipped, population, energy, state, fingerprint,
                     density), discontinuity_evidence
-        if not crossed and not discontinuity:
+        if not crossed and not discontinuity and not numerical_jump:
             # Update the bracket so that it always straddles the target.
             if (population-target)*(left_pop-target) <= 0:
                 right_mult, right_pop = left_mult, left_pop
@@ -1202,11 +1350,18 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         # scan declared unsuccessful. The refinement also reports the
         # discontinuities that it observed, which is the evidence for a
         # structural gap between two electronic branches.
+        # The curvature deviations that the strict test cleared are collected
+        # separately. They are not discontinuities and they carry no
+        # information about a gap, but they explain why the response was
+        # curved over the bracket, which is what made the linear prediction
+        # of the bracket inaccurate.
+        curvature_evidence = []
         refined, discontinuity_evidence = _refine(
             converged_points, target, population_tol, inner_solve,
             density_tol, lambda d: constraint.population(d),
             overlap, eigvals, eigvecs, max_iterations, emit,
-            branch_check, fragment_weights, branch_identity_tol)
+            branch_check, fragment_weights, branch_identity_tol,
+            curvature_sink=curvature_evidence)
         if refined is not None:
             multiplier, population, energy, state, fingerprint, dens = refined
             root = multiplier
@@ -1267,6 +1422,23 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                             'confirmed multivalued)'
                             % (target, len(observed)))
                         reason = unresolved
+                    elif curvature_evidence:
+                        # The strict test cleared every deviation, so the
+                        # response is single valued and the trial that
+                        # deviated was on the bracketed branch. The target is
+                        # not inside a gap and not beyond a fold; the
+                        # refinement ran out of its iterations before it
+                        # reached it.
+                        unresolved = (
+                            'the target population %.6g was not reached within '
+                            'the refinement budget; the response is single '
+                            'valued at every trial, so the target is not in a '
+                            'gap, and %d deviations from the bracket '
+                            'prediction were cleared by the strict test and '
+                            'are the curvature of the response over the '
+                            'bracket'
+                            % (target, len(curvature_evidence)))
+                        reason = unresolved
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
                                      'points': points, 'switches': switches,
                                      'branches': branches,
@@ -1274,6 +1446,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                                      'branch_gap': gap,
                                      'branch_unreachable': unreachable,
                                      'branch_unresolved': unresolved,
+                                     'curvature_deviations': curvature_evidence,
                                      'discontinuities': discontinuity_evidence,
                                      'log': list(records)}
             if gap is not None:
