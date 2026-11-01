@@ -349,33 +349,49 @@ def _branch_gap(converged_points, target, discontinuity_evidence=None):
     '''
     if not converged_points:
         return None
-    # Each observed discontinuity separates two branches. The two limits of
-    # the discontinuity are the populations that the branches reach: the
-    # population of the trial that was rejected and the population that the
-    # bracket predicted for it. A target that falls strictly between those
-    # limits is attained by neither branch, because the response does not
-    # take the intermediate values.
+    # Only a confirmed fold establishes a structural gap.
+    #
+    # A discontinuity that was observed but not confirmed is not enough. The
+    # anomaly that triggers the confirmation is the disagreement between a
+    # refinement trial and the linear interpolation of its bracket, and that
+    # disagreement is produced by *any* target that lies inside the bracket,
+    # not only by a genuine discontinuity of the constrained response. A
+    # target that lies between two scan points therefore produces the same
+    # observation as a fold does, and the two cannot be told apart from the
+    # refinement alone.
+    #
+    # The difference is decisive for the conclusion. A confirmed fold means
+    # that no branch attains the target, which is a statement about the
+    # model. An unconfirmed observation means only that the target was not
+    # reached from the bracketed side at the resolution of the search, which
+    # is a statement about the search and may be resolved by a denser scan
+    # or by a tighter criterion. Reporting the second as the first turns a
+    # numerical limitation into a scientific conclusion.
+    #
+    # The limits of the gap are the populations that the two branches
+    # actually reach, and they are taken from the *observed* trials of the
+    # confirmed fold, not from the coarse scan bracket. This distinction
+    # decides the outcome on the V2-04c D1 case: the coarse bracket that
+    # straddles the fold spans the populations 14.173 and 12.259, and the
+    # target 14.0 lies below the lower limit, so the coarse bracket reports
+    # "out of range". The observed limits are 14.0528 on the lower branch
+    # and 13.9145 on the upper branch, and the target 14.0 lies strictly
+    # between them. Only the observed limits identify the target as
+    # unattainable; the coarse bracket hides the gap entirely.
+    #
+    # The comparison is direction agnostic, because the constrained
+    # population may decrease or increase with the multiplier depending on
+    # the sign of the constraint weights.
     for evidence in (discontinuity_evidence or []):
         # A fold that was confirmed by the strict multivaluedness test gives
         # the two limits of the gap directly: those are the populations that
         # the two branches actually reach.
         fold = evidence.get('fold')
-        if fold is not None:
-            limits = [float(x) for x in fold['limits']]
-        else:
-            # The population that the bracketed branch predicts at the trial
-            # point is the limit of the lower branch, and the measured
-            # population of the rejected trial is the limit of the upper
-            # branch. The coarse bracket endpoints are *not* used: they are
-            # the populations of two scan points that lie far away from the
-            # fold.
-            limits = []
-            if 'bracket_prediction' in evidence:
-                limits.append(float(evidence['bracket_prediction']))
-            if 'population' in evidence:
-                limits.append(float(evidence['population']))
-            if len(limits) < 2:
-                limits = [float(x) for x in evidence.get('bracket_populations', [])]
+        if fold is None:
+            # Not confirmed by the strict test. The observation is recorded
+            # as evidence but it does not establish a gap.
+            continue
+        limits = [float(x) for x in fold['limits']]
         if len(limits) < 2:
             continue
         lower, upper = min(limits), max(limits)
@@ -1210,8 +1226,17 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             # multivalued and the target falls into the gap between two
             # electronic branches. That is a statement about the model, not
             # about the numerics, and it must be reported as such.
+            #
+            # The gap is reported only when the strict multivaluedness test
+            # confirmed a fold. An observed but unconfirmed discontinuity is
+            # not enough, because the same observation is produced by a
+            # target that merely lies inside the bracket. Such a case is
+            # reported as an unresolved search, which is a different
+            # situation and calls for a different action: a denser scan or
+            # a tighter criterion, rather than a written-off conclusion.
             gap = _branch_gap(converged_points, target, discontinuity_evidence)
             unreachable = None
+            unresolved = None
             if gap is not None:
                 reason = ('the target population %.6g lies in a gap between two '
                           'electronic branches: %s' % (target, gap))
@@ -1224,12 +1249,31 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                 if unreachable is not None:
                     reason = ('the target population %.6g is not reached by '
                               'the bracketed branch: %s' % (target, unreachable))
+                else:
+                    # A discontinuity was observed but the strict test did
+                    # not confirm it. The target may lie inside the bracket
+                    # on a single-valued response, in which case the
+                    # observation is expected and carries no information
+                    # about a gap.
+                    observed = [e for e in (discontinuity_evidence or [])
+                                if e.get('multivalued_confirmed') is False]
+                    if observed:
+                        unresolved = (
+                            'the target population %.6g was not reached from '
+                            'the bracketed side and no confirmed fold was '
+                            'observed; the target lies inside the bracket of a '
+                            'response that is unresolved at the resolution of '
+                            'the search (%d observed discontinuities, none '
+                            'confirmed multivalued)'
+                            % (target, len(observed)))
+                        reason = unresolved
             cdft.LAST_BRANCH_SCAN = {'converged': False, 'reason': reason,
                                      'points': points, 'switches': switches,
                                      'branches': branches,
                                      'rejected_by_branch': rejected_by_branch,
                                      'branch_gap': gap,
                                      'branch_unreachable': unreachable,
+                                     'branch_unresolved': unresolved,
                                      'discontinuities': discontinuity_evidence,
                                      'log': list(records)}
             if gap is not None:

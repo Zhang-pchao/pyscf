@@ -802,7 +802,8 @@ class PhysicalFingerprint(unittest.TestCase):
         # Two branches with disjoint population coverage and the target
         # between them is a structural gap between electronic branches, not
         # a numerical failure. The evidence is the discontinuity that the
-        # refinement observed on the bracketed branch.
+        # refinement observed on the bracketed branch, and it must have been
+        # confirmed by the strict multivaluedness test.
         def point(multiplier, population, spin_square):
             fingerprint = cdft_branch.BranchFingerprint(
                 spin_square=spin_square, total_spin=2.0, atom_spins=(2.0,),
@@ -816,7 +817,10 @@ class PhysicalFingerprint(unittest.TestCase):
         # them and is therefore attained by neither branch.
         evidence = [{'bracket_populations': [13.9, 12.1],
                      'multiplier_hartree': 0.0, 'population': 12.1,
-                     'bracket_prediction': 13.9, 'anomaly_electrons': 1.8}]
+                     'bracket_prediction': 13.9, 'anomaly_electrons': 1.8,
+                     'multivalued_confirmed': True,
+                     'fold': {'limits': [12.1, 13.9],
+                              'separation_electrons': 1.8}}]
         gap = cdft_branch._branch_gap(points, 13.0, evidence)
         self.assertIsNotNone(gap)
         # A target that is reached must not be reported as a gap.
@@ -825,6 +829,11 @@ class PhysicalFingerprint(unittest.TestCase):
         self.assertIsNone(cdft_branch._branch_gap(points, 20.0, evidence))
         # Without the evidence of a discontinuity there is no gap to report.
         self.assertIsNone(cdft_branch._branch_gap(points, 13.0))
+        # The same observation without a confirmed fold is not a gap, because
+        # a target that lies inside the bracket produces it as well.
+        unconfirmed = [{k: v for k, v in evidence[0].items()
+                        if k not in ('fold', 'multivalued_confirmed')}]
+        self.assertIsNone(cdft_branch._branch_gap(points, 13.0, unconfirmed))
 
     def test_a_hole_migration_is_a_branch_switch_even_with_a_high_overlap(self):
         # The V2-04c D1 case measured a discontinuity of the constrained
@@ -848,12 +857,16 @@ class PhysicalFingerprint(unittest.TestCase):
         # bracket prediction. The two limits of the discontinuity are the
         # population that the bracketed branch predicts and the population
         # that the rejected trial measured. The target 14.0 lies between
-        # them.
+        # them. The strict multivaluedness test confirmed the fold, which is
+        # what makes the gap a statement about the model.
         evidence = [{'bracket_populations': [14.059, 13.888],
                      'multiplier_hartree': 0.02358, 'population': 13.9145,
                      'bracket_prediction': 14.0525, 'anomaly_electrons': 0.086,
                      'density_overlap': 0.998, 'total_spin': 2.0,
-                     'spin_square': 2.0114}]
+                     'spin_square': 2.0114,
+                     'multivalued_confirmed': True,
+                     'fold': {'limits': [13.9145, 14.0525],
+                              'separation_electrons': 0.138}}]
         gap = cdft_branch._branch_gap(points, 14.0, evidence)
         self.assertIsNotNone(gap)
         self.assertIn('separated by', gap)
@@ -945,6 +958,67 @@ class PhysicalFingerprint(unittest.TestCase):
                     np.zeros((1, 1, 1)))
         points = [point(-1., 14.2), point(-0.5, 13.9), point(0.5, 13.6)]
         self.assertIsNone(cdft_branch._branch_gap(points, 13.75))
+
+    def test_an_unconfirmed_discontinuity_is_not_a_structural_gap(self):
+        # A discontinuity that the strict multivaluedness test did not
+        # confirm must not be reported as a structural gap.
+        #
+        # The observation that triggers the confirmation is the
+        # disagreement between a refinement trial and the linear
+        # interpolation of its bracket, and that disagreement is produced by
+        # any target that lies inside the bracket, not only by a genuine
+        # discontinuity. A target between two scan points therefore produces
+        # exactly the same observation as a fold does.
+        #
+        # Measured on the V2-04b collective-P case at the 1.21 Angstrom
+        # geometry: the coarse scan brackets the target 12 between the
+        # populations 12.27703 and 10.69068, the refinement produced 34
+        # discontinuities of which none was confirmed multivalued, and the
+        # solver nevertheless reported a gap between 11.614795 and
+        # 12.054537. That is a statement about the search, not about the
+        # model, and reporting it as a gap would have written off a target
+        # that the model may well contain.
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(0.125, 12.27703), point(0.25, 10.69068)]
+        evidence = [{'multiplier_hartree': 0.147877,
+                     'population': 12.054537,
+                     'bracket_prediction': 11.614795,
+                     'anomaly_electrons': 0.1976,
+                     'multivalued_confirmed': False}]
+        self.assertIsNone(cdft_branch._branch_gap(points, 12.0, evidence))
+        # The same observation with a confirmed fold is a gap.
+        confirmed = [dict(evidence[0],
+                          multivalued_confirmed=True,
+                          fold={'limits': [11.614795, 12.054537],
+                                'separation_electrons': 0.439742})]
+        gap = cdft_branch._branch_gap(points, 12.0, confirmed)
+        self.assertIsNotNone(gap)
+        self.assertIn('separated by', gap)
+
+    def test_an_unconfirmed_discontinuity_is_reported_as_unresolved(self):
+        # The unresolved case must be distinguishable from a gap and from a
+        # plain failure to converge, because the three call for different
+        # actions: write off the target, search from the other branch, or
+        # search harder.
+        def point(multiplier, population):
+            fingerprint = cdft_branch.BranchFingerprint(
+                spin_square=2.0, total_spin=2.0, atom_spins=(2.0,),
+                population=population)
+            return (multiplier, population, 0., None, fingerprint,
+                    np.zeros((1, 1, 1)))
+        points = [point(0.125, 12.27703), point(0.25, 10.69068)]
+        evidence = [{'multiplier_hartree': 0.147877,
+                     'population': 12.054537,
+                     'bracket_prediction': 11.614795,
+                     'anomaly_electrons': 0.1976,
+                     'multivalued_confirmed': False}]
+        self.assertIsNone(cdft_branch._branch_unreachable(evidence, 12.0))
+        self.assertIsNone(cdft_branch._branch_gap(points, 12.0, evidence))
 
     def test_branch_gap_error_is_a_distinct_failure_mode(self):
         # The gap failure must be distinguishable from a plain branch switch,
