@@ -147,11 +147,25 @@ def spin_square_from_density(density, overlap):
     The formula is the one that ``pyscf.scf.uhf.spin_square`` applies to the
     occupied orbitals, written in the density matrix instead:
 
-    ``S^2 = 1/2 (n_a + n_b - Tr(D_a S D_b S)) + 1/4 (n_b - n_a)^2``
+    ``S^2 = 1/2 (n_a + n_b) - Tr(D_a S D_b S) + 1/4 (n_b - n_a)^2``
 
     The trace term is the exchange integral of the occupied alpha and beta
     sets, ``<i^a|j^b> <j^b|i^a>`` summed over the occupied orbitals, which
     the density matrix expresses as ``Tr(D_a S D_b S)``.
+
+    The exchange term carries **no factor of one half**, and that detail is
+    easy to get wrong. The orbital route evaluates
+    ``1/2 (n_a - sum_ij <i^a|j^b><j^b|i^a> + n_b - sum_ij <i^b|j^a><j^a|i^b>)``,
+    and the two sums are equal, so the halves combine and the exchange
+    enters once. An earlier version of this helper wrote
+    ``1/2 (n_a + n_b - Tr(D_a S D_b S))``, which halves the exchange and
+    inflates the spin square.
+
+    The size of the error is not small. On the V2-04b collective-P state the
+    two routes gave 2.0076 and 13.0047 for the same converged density, and
+    the larger value is the wrong one. A spin square of 13 for a state
+    whose total spin is 2.0 is physically impossible for a doublet, so the
+    error is not a small numerical discrepancy but a mislabelled state.
 
     This route is needed when the orbital set is not available, which happens
     when a branch scan refines a density matrix rather than an orbital set.
@@ -168,7 +182,7 @@ def spin_square_from_density(density, overlap):
     n_beta = float(np.einsum('ij,ji', dm_beta, overlap))
     exchange = float(np.einsum('ij,ji', dm_alpha @ overlap,
                                dm_beta @ overlap))
-    return 0.5*(n_alpha+n_beta-exchange)+0.25*(n_beta-n_alpha)**2
+    return 0.5*(n_alpha+n_beta)-exchange+0.25*(n_beta-n_alpha)**2
 
 
 def _fingerprint(method, density, population, overlap, eigvals, eigvecs, previous,
@@ -1633,6 +1647,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                              'branch_gap': None,
                              'branch_unreachable': None,
                              'branch_unresolved': None,
+                             'domain_exhaustion': None,
                              'curvature_deviations': [],
                              'discontinuities': [],
                              'log': list(records)}

@@ -1198,6 +1198,74 @@ class PhysicalFingerprint(unittest.TestCase):
                 density, overlap)
             self.assertAlmostEqual(from_density, orbital, places=6)
 
+    def test_spin_square_from_density_is_checked_where_the_exchange_is_not_zero(self):
+        # The single electron case above cannot tell the two routes apart,
+        # because the exchange term vanishes there and the two formulas
+        # differ only in that term. A state with both an alpha and a beta
+        # electron is therefore needed, and the agreement has to be exact
+        # rather than approximate.
+        #
+        # The OH radical is used because it is a genuine open shell doublet:
+        # one unpaired electron on a heavy centre, with both spin channels
+        # occupied and the exchange term well away from zero.
+        mol = gto.M(atom=[('O', (0., 0., 0.)), ('H', (0., 0., 0.97))],
+                    basis='sto-3g', charge=0, spin=1, verbose=0)
+        mf = dft.UKS(mol)
+        mf.xc = 'pbe0'
+        mf.grids.level = 1
+        mf.grids.prune = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-7
+        mf.kernel()
+        density = mf.make_rdm1()
+        overlap = mf.get_ovlp()
+        orbital = float(mf.spin_square()[0])
+        from_density = cdft_branch.spin_square_from_density(density, overlap)
+        # The exchange term must actually be exercised by this state.
+        exchange = float(np.einsum('ij,ji', density[0] @ overlap,
+                                   density[1] @ overlap))
+        self.assertGreater(abs(exchange), 0.1)
+        self.assertAlmostEqual(from_density, orbital, places=6)
+        # A doublet has a spin square of 0.75. A value far from it would
+        # mean that the two routes agree on something wrong.
+        self.assertLess(abs(orbital-0.75), 0.3)
+
+    def test_the_spin_square_of_the_v2_04b_collective_state_is_a_doublet(self):
+        # The V2-04b collective-P state reported a spin square of 13.0 from
+        # the density route while the orbital route of the same state gave
+        # 2.01. A spin square of 13 for a state whose total spin is 2 is
+        # physically impossible for a doublet, and the error was the missing
+        # factor of two on the exchange term.
+        #
+        # The regression is checked on the exchange term itself, because the
+        # state is not reproduced here. What the check pins is that the
+        # exchange enters once and not twice, and it does so on a state whose
+        # exchange term is large enough for the two to differ.
+        mol = gto.M(atom=[('O', (0., 0., 0.)), ('H', (0., 0., 0.97))],
+                    basis='sto-3g', charge=0, spin=1, verbose=0)
+        mf = dft.UKS(mol)
+        mf.xc = 'pbe0'
+        mf.grids.level = 1
+        mf.grids.prune = None
+        mf.small_rho_cutoff = 0
+        mf.conv_tol = 1e-12
+        mf.conv_tol_grad = 1e-7
+        mf.kernel()
+        density = mf.make_rdm1()
+        overlap = mf.get_ovlp()
+        n_alpha = float(np.einsum('ij,ji', density[0], overlap))
+        n_beta = float(np.einsum('ij,ji', density[1], overlap))
+        exchange = float(np.einsum('ij,ji', density[0] @ overlap,
+                                   density[1] @ overlap))
+        # The formula that halved the exchange, which is the one that
+        # produced 13.0 instead of 2.01.
+        halved = 0.5*(n_alpha+n_beta-exchange)+0.25*(n_beta-n_alpha)**2
+        correct = 0.5*(n_alpha+n_beta)-exchange+0.25*(n_beta-n_alpha)**2
+        self.assertNotAlmostEqual(halved, correct, places=3)
+        self.assertAlmostEqual(
+            correct, float(mf.spin_square()[0]), places=6)
+
     def test_spin_square_survives_a_missing_orbital_set(self):
         # A state that was produced as a density matrix has no mo_coeff, and
         # the orbital route then raises. The fingerprint must still carry a
