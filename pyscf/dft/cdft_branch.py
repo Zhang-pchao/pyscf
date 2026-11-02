@@ -336,7 +336,18 @@ def _scan_cache_key(constraint, method, axis, inner_solver, inner_grad_tol,
     """
     h = hashlib.sha256()
     h.update(np.asarray(constraint.atom_weights, dtype='<f8').tobytes())
+    # The matrix of the constraint is hashed byte for byte, and so is the
+    # identity of the proatom references that the matrix is built from.
+    # Two independent constructions of the same constraint differ in the
+    # last bits of their matrices, because the atomic references are
+    # solved afresh, so the byte for byte hash is also the hash that
+    # distinguishes them. A caller that wants two states to share one
+    # scan has to share the construction of the constraint, and this key
+    # then reports that they do.
     h.update(np.asarray(constraint.matrix, dtype='<f8').tobytes())
+    reference_hash = getattr(constraint, 'reference_sha256', None)
+    if reference_hash:
+        h.update(reference_hash.encode())
     h.update(np.asarray(axis, dtype='<f8').tobytes())
     h.update(str(inner_solver).encode())
     h.update(np.float64(inner_grad_tol).tobytes())
@@ -1586,6 +1597,12 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         raise cdft.ConvergenceError(
             'Branch scan found no converged constrained state: %s' % reason)
 
+    if scan_cache is not None:
+        import os as _os
+        if _os.environ.get('QMDPA_SCAN_CACHE_DEBUG'):
+            print('CACHE key=%s hit=%s entries=%d' % (
+                (cache_key or 'none')[:16], cached is not None, len(scan_cache)),
+                flush=True)
     if cache_key is not None and cached is None:
         # The scan of this axis is stored, so that the next target of the
         # same constraint reuses it. The stored map is the map that was
