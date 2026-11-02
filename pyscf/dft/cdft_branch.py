@@ -1515,7 +1515,12 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     density = None if dm0 is None else np.array(dm0, copy=True)
     previous_density = None
     previous_fingerprint = None
-    converged_points = []
+    if cached is None:
+        # A reused scan brings its own converged points, which carry the
+        # densities and the fingerprints that the refinement and the branch
+        # summary need. Resetting them here would empty the reused scan and
+        # leave the solver with no point to select from.
+        converged_points = []
 
     def inner_solve(multiplier, start_density):
         '''Run one fully converged inner UKS at a fixed multiplier.'''
