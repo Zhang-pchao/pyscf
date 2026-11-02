@@ -706,13 +706,54 @@ def _probe_multivalued(multiplier, left_density, right_density, inner_solve,
             'separation_electrons': float(upper-lower),
             'total_spins': [float(f.total_spin) for f in fingerprints],
             'spin_squares': [float(f.spin_square) for f in fingerprints],
-            'fragment_spins': [list(f.fragment_spins) for f in fingerprints]}
+            'fragment_spins': [list(f.fragment_spins) for f in fingerprints],
+            # The two densities of the two branches are kept out of the
+            # record itself, because the record is serialised to JSON and
+            # a density is an array. They are handed to the sink that the
+            # caller supplies, which writes them where they can be read
+            # back.
+            '_densities': [np.asarray(first[1]), np.asarray(second[1])]}
+
+
+def _release_fold_densities(fold, fold_density_sink):
+    '''Hand the two branch densities of a confirmed fold to a sink.
+
+    The densities of the two branches of a confirmed fold are the only way
+    to follow the other branch: a scan that reaches a fold and does not
+    keep them forces the next scan to start from the same branch and to
+    find the same fold again. The sink is what keeps them.
+
+    The densities are removed from the returned fold, because the record is
+    serialised to JSON and a density is an array. The fold that is handed
+    to the sink is a copy that is independent of the returned record, so a
+    consumer that writes the densities to disk cannot change what the
+    record says.
+
+    Args:
+        fold: the confirmed fold, possibly carrying ``_densities``.
+        fold_density_sink: optional callable taking the fold and the two
+            densities, or ``None`` to discard them.
+
+    Returns:
+        The fold without the densities.
+    '''
+    if fold is None:
+        return fold
+    densities = fold.get('_densities')
+    if fold_density_sink is not None and densities is not None:
+        # The copy handed to the sink is independent of the returned record,
+        # and it carries the same clean fields, so that a consumer that
+        # writes the densities to disk cannot change what the record says
+        # and cannot mistake the densities for a field of the fold.
+        clean = {k: v for k, v in fold.items() if k != '_densities'}
+        fold_density_sink(clean, list(densities))
+    return {k: v for k, v in fold.items() if k != '_densities'}
 
 
 def _refine(converged_points, target, population_tol, inner_solve, density_tol,
             population_of, overlap, eigvals, eigvecs, max_iterations=40, emit=None,
             branch_check=None, fragment_weights=None, branch_identity_tol=0.2,
-            curvature_sink=None):
+            curvature_sink=None, fold_density_sink=None):
     '''Polish a bracket on a single branch with a guarded secant iteration.
 
     The bracket is formed from two neighbouring scan points whose populations
@@ -1039,6 +1080,13 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 'bracket_range': [float(range_lower), float(range_upper)],
             }
             if fold is not None:
+                # The densities of the two branches are handed to the sink
+                # and then removed from the fold, because the record is
+                # serialised to JSON and a density is an array. The copy
+                # that is handed over is independent of the record, so a
+                # consumer that writes it to disk cannot change what the
+                # record says.
+                fold = _release_fold_densities(fold, fold_density_sink)
                 evidence['fold'] = fold
                 # The two limits of the fold are the populations that the two
                 # branches actually reach. They are the quantities that
@@ -1225,7 +1273,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                        scan_mode='uniform', scan_log=None, scan_upper=None,
                        required_signed_spin=None, required_atom_spins=None,
                        spin_tol=0.2, refine=True, scf_tol_grad=None,
-                       fragment_weights=None, branch_identity_tol=0.2):
+                       fragment_weights=None, branch_identity_tol=0.2,
+                       fold_density_sink=None):
     '''Solve one constrained UKS state with an explicit branch-aware scan.
 
     The multiplier axis is sampled on a fixed grid. Each grid point runs one
@@ -1492,7 +1541,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             density_tol, lambda d: constraint.population(d),
             overlap, eigvals, eigvecs, max_iterations, emit,
             branch_check, fragment_weights, branch_identity_tol,
-            curvature_sink=curvature_evidence)
+            curvature_sink=curvature_evidence,
+            fold_density_sink=fold_density_sink)
         if refined is not None:
             multiplier, population, energy, state, fingerprint, dens = refined
             root = multiplier

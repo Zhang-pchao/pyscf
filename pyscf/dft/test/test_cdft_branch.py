@@ -1378,3 +1378,57 @@ class DomainExhaustion(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def test_the_confirmed_fold_hands_its_two_densities_to_the_sink(self):
+        """A confirmed fold must be able to give away the two branch densities.
+
+        The gate of V2-04e needs to follow the other branch after a fold is
+        found, and the only way to follow it is to start the next scan from
+        the density of the other branch. The fold therefore has to be able
+        to hand its two densities over.
+
+        The record itself must not carry them: the record is serialised to
+        JSON, and a density is an array. Both halves are asserted here at
+        once, that the probe reports the two densities and that the fold
+        that the caller receives carries no array.
+        """
+        import numpy as np
+
+        densities = [np.zeros((2, 2)), np.ones((2, 2))]
+        fold = {'multiplier_hartree': -0.1,
+                'populations': [1.0, 2.0],
+                'limits': [1.0, 2.0],
+                'separation_electrons': 1.0,
+                'total_spins': [0.0, 0.0],
+                'spin_squares': [0.0, 0.0],
+                'fragment_spins': [[], []],
+                '_densities': densities}
+
+        captured = {}
+        released = cdft_branch._release_fold_densities(
+            fold, lambda f, d: captured.update({'fold': f, 'densities': d}))
+
+        # The sink must be called, and it must receive both densities.
+        self.assertTrue(captured, "the sink was never called")
+        self.assertEqual(len(captured['densities']), 2)
+        self.assertTrue(isinstance(captured['densities'][0], np.ndarray))
+        self.assertTrue(isinstance(captured['densities'][1], np.ndarray))
+        # The record that the caller receives must be free of arrays, so
+        # that it can be serialised.
+        self.assertNotIn('_densities', released)
+        self.assertEqual(released['limits'], [1.0, 2.0])
+        # The copy that was handed to the sink must be independent of the
+        # returned record: a consumer that writes the densities to disk
+        # cannot change what the record says. It must also be free of the
+        # densities itself, so that a consumer cannot mistake them for a
+        # field of the fold.
+        self.assertNotIn('_densities', captured['fold'])
+        self.assertIsNot(captured['fold'], released)
+        self.assertEqual(captured['fold']['limits'], [1.0, 2.0])
+
+        # A fold without a sink must still come back clean.
+        without = cdft_branch._release_fold_densities(fold, None)
+        self.assertNotIn('_densities', without)
+
+        # A missing fold must not raise.
+        self.assertIsNone(cdft_branch._release_fold_densities(None, None))
