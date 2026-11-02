@@ -1463,6 +1463,13 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     # while the scan is still running. In both cases the records are also
     # kept in an internal list, so that the completed scan can always report
     # its own log.
+    # The inner SCF gradient tolerance is independent of the constraint
+    # residual tolerance. It defaults to the method's own limit, and never
+    # to population_tol, which lives on a different scale entirely. It is
+    # computed here, before the cache key, because the key has to contain
+    # it: a scan that was run with one inner tolerance is not the scan of
+    # another inner tolerance.
+    inner_grad_tol = limit*.1 if scf_tol_grad is None else float(scf_tol_grad)
     cache_key = None
     cached = None
     if scan_cache is not None:
@@ -1485,10 +1492,6 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
              'computed before')
 
     mf = method.copy()
-    # The inner SCF gradient tolerance is independent of the constraint
-    # residual tolerance. It defaults to the method's own limit, and never
-    # to population_tol, which lives on a different scale entirely.
-    inner_grad_tol = limit*.1 if scf_tol_grad is None else float(scf_tol_grad)
     mf.conv_tol_grad = inner_grad_tol
     mf.grids = method.grids.copy()
     mf.chkfile = None
