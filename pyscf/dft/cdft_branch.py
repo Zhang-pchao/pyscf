@@ -397,13 +397,31 @@ def _branch_gap(converged_points, target, discontinuity_evidence=None):
     # observation as a fold does, and the two cannot be told apart from the
     # refinement alone.
     #
-    # The difference is decisive for the conclusion. A confirmed fold means
-    # that no branch attains the target, which is a statement about the
-    # model. An unconfirmed observation means only that the target was not
+    # The difference is decisive for the conclusion, and the scope of the
+    # conclusion matters as much as its kind. A confirmed fold means that
+    # within the searched multiplier domain, and from the starting
+    # densities that were tested, no branch attained the target. That is a
+    # statement about the *search*, not about the model. A response that is
+    # multivalued at one multiplier is not thereby exhausted: a branch may
+    # attain the target at a different multiplier, and the search did not
+    # follow the branch past the point where the fold was detected.
+    #
+    # The counterexample is elementary and needs no electronic structure
+    # calculation. Two smooth decreasing responses, C_A(lambda) = -lambda
+    # and C_B(lambda) = 2 - lambda, are multivalued at lambda = 0, where
+    # they give 0 and 2. A target of 1 lies strictly between the two
+    # populations, yet it is attained by A at lambda = -1 and by B at
+    # lambda = +1. The premise therefore does not imply that the target is
+    # unattainable. A multivalued response at one multiplier is evidence of
+    # multiple stationary solutions of the constrained problem, which is a
+    # real and useful observation, and it is not evidence that the target
+    # does not exist.
+    #
+    # An unconfirmed observation means only that the target was not
     # reached from the bracketed side at the resolution of the search, which
     # is a statement about the search and may be resolved by a denser scan
-    # or by a tighter criterion. Reporting the second as the first turns a
-    # numerical limitation into a scientific conclusion.
+    # or by a tighter criterion. Reporting either as a global absence of
+    # the target turns a numerical limitation into a scientific conclusion.
     #
     # The limits of the gap are the populations that the two branches
     # actually reach, and they are taken from the *observed* trials of the
@@ -449,10 +467,12 @@ def _branch_unreachable(discontinuity_evidence, target):
     does not, so the refinement cannot get there from the bracketed side.
 
     The two situations must not be conflated. A gap is a statement about the
-    model: no branch attains the target. A target beyond the fold is a
-    statement about the *search*: the target exists, but the warm start has
-    to be taken from the other side of the fold. Reporting the second as a
-    bare failure to converge hides the fact that the target is attainable.
+    searched domain and the tested seeds: within the domain that was
+    searched, no branch that the search followed attained the target. A
+    target beyond the fold is a statement about the *search*: the target
+    exists, but the warm start has to be taken from the other side of the
+    fold. Reporting the second as a bare failure to converge hides the fact
+    that the target is attainable.
 
     Measured on the V2-04c D1 case at the 1.33 Angstrom geometry: the fold
     limits are 12.434 and 13.786 while the target is 14.0, so the target is
@@ -491,7 +511,8 @@ def _domain_exhaustion(converged_points, target, bound):
     attainable at a larger |lambda|; nothing observed so far says it is not.
 
     This is deliberately different from a gap. A gap is a property of the
-    model: two branches cover disjoint population intervals and the target
+    searched domain and the tested seeds: two branches cover disjoint
+    population intervals within the domain that was searched and the target
     lies between them. A domain exhaustion is a property of the search: the
     branch that is being followed approaches the target as the multiplier
     grows, so the axis ended before the branch arrived.
@@ -1580,12 +1601,15 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             # It is checked before the fold and curvature cases because those
             # describe what happens *inside* the domain, while this one
             # describes running out of domain. A confirmed gap keeps priority
-            # over it, because a gap is a model-level fact and settles the
-            # question on its own.
+            # over it, because a gap settles the question within the searched
+            # domain and the tested seeds, and the domain exhaustion is a
+            # statement about the part of the axis that was not searched.
             exhausted = _domain_exhaustion(converged_points, target, bound)
             if gap is not None:
                 reason = ('the target population %.6g lies in a gap between two '
-                          'electronic branches: %s' % (target, gap))
+                          'electronic branches within the searched multiplier '
+                          'domain and the tested starting densities: %s'
+                          % (target, gap))
             elif exhausted is not None:
                 reason = ('the target population %.6g is outside the searched '
                           'multiplier domain: %s' % (target, exhausted))
