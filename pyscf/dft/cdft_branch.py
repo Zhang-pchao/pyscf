@@ -40,6 +40,7 @@ Atomic units throughout.
 '''
 
 from dataclasses import dataclass, field
+import hashlib
 
 import numpy as np
 
@@ -297,6 +298,62 @@ def _scan_axis(bound, scan_points, scan_mode):
         magnitude = np.geomspace(max(bound*1e-3, 1e-6), bound, int(scan_points)//2)
         axis = np.concatenate([-magnitude[::-1], magnitude])
     return np.unique(axis)
+
+
+def _make_recorder(records, scan_log):
+    """Return a recorder that appends to the records and to the sink.
+
+    The sink is either a list that is filled in place, or a callable that is
+    called for every record. A callable lets a caller stream the log while
+    the scan is still running. In both cases the records are also kept in an
+    internal list, so that the completed scan can always report its own log.
+    """
+    if scan_log is None:
+        def emit(message):
+            records.append(message)
+    elif callable(scan_log):
+        def emit(message):
+            records.append(message)
+            scan_log(message)
+    else:
+        def emit(message):
+            records.append(message)
+            scan_log.append(message)
+    return emit
+
+
+def _scan_cache_key(constraint, method, axis, inner_solver, inner_grad_tol,
+                    density_tol, scan_mode, fragment_weights):
+    """Return a fingerprint of everything that the branch scan depends on.
+
+    The scan of the constrained response depends on the constraint, on the
+    method, on the multiplier axis and on the solver controls. It does not
+    depend on the target, because the target selects a point of the map
+    that the scan produces. A key that omitted any of the dependencies would
+    let the scan of one configuration be reused for another, and the reused
+    map would then be a map of the wrong constraint. Every dependency is
+    therefore part of the key.
+    """
+    h = hashlib.sha256()
+    h.update(np.asarray(constraint.atom_weights, dtype='<f8').tobytes())
+    h.update(np.asarray(constraint.matrix, dtype='<f8').tobytes())
+    h.update(np.asarray(axis, dtype='<f8').tobytes())
+    h.update(str(inner_solver).encode())
+    h.update(np.float64(inner_grad_tol).tobytes())
+    h.update(np.float64(density_tol).tobytes())
+    h.update(str(scan_mode).encode())
+    h.update(str(getattr(method, 'xc', '')).encode())
+    h.update(str(getattr(method, 'conv_tol', '')).encode())
+    h.update(str(getattr(method, 'conv_tol_grad', '')).encode())
+    h.update(str(getattr(method, 'max_cycle', '')).encode())
+    h.update(str(getattr(method.grids, 'level', '')).encode())
+    h.update(str(getattr(method.grids, 'prune', '')).encode())
+    h.update(np.asarray([method.mol.natm, method.mol.nelectron]).tobytes())
+    h.update(method.mol.energy_nuc().tobytes() if hasattr(method.mol, 'energy_nuc')
+             else b'')
+    if fragment_weights is not None:
+        h.update(np.asarray(fragment_weights, dtype='<f8').tobytes())
+    return h.hexdigest()
 
 
 def _branch_mismatch(fingerprint, required_signed_spin, required_atom_spins,
@@ -1295,7 +1352,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                        required_signed_spin=None, required_atom_spins=None,
                        spin_tol=0.2, refine=True, scf_tol_grad=None,
                        fragment_weights=None, branch_identity_tol=0.2,
-                       fold_density_sink=None):
+                       fold_density_sink=None, scan_cache=None):
     '''Solve one constrained UKS state with an explicit branch-aware scan.
 
     The multiplier axis is sampled on a fixed grid. Each grid point runs one
@@ -1392,23 +1449,40 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     axis = _scan_axis(bound, scan_points, scan_mode)
     points = []
     switches = []
+    # The scan does not depend on the target: it maps the constrained
+    # response of this constraint over the multiplier axis, and the target
+    # only selects a point of that map. Two targets of the same constraint
+    # therefore scan the same axis and produce the same points, and running
+    # the scan twice costs twice the time for one number. The cache holds
+    # the scan of one axis, keyed by a fingerprint of everything that the
+    # scan depends on, so that a reused scan is the scan that would have
+    # been produced, and a scan of a different constraint or of a different
+    # method is never reused.
     # The scan log may be a list that is filled in place, or a callable that
     # is called for every record. A callable lets a caller stream the log
     # while the scan is still running. In both cases the records are also
     # kept in an internal list, so that the completed scan can always report
     # its own log.
-    records = []
-    if scan_log is None:
-        def emit(message):
-            records.append(message)
-    elif callable(scan_log):
-        def emit(message):
-            records.append(message)
-            scan_log(message)
+    cache_key = None
+    cached = None
+    if scan_cache is not None:
+        cache_key = _scan_cache_key(constraint, method, axis, inner_solver,
+                                    inner_grad_tol, density_tol, scan_mode,
+                                    fragment_weights)
+        cached = scan_cache.get(cache_key)
+    if cached is not None:
+        points = cached['points']
+        switches = cached['switches']
+        converged_points = cached['converged_points']
+        records = list(cached['records'])
     else:
-        def emit(message):
-            records.append(message)
-            scan_log.append(message)
+        records = []
+    emit = _make_recorder(records, scan_log)
+    if cached is not None:
+        emit('SCAN REUSED from the cache of this run: the axis, the '
+             'constraint, the method and the solver controls are the same, '
+             'so the map of the constrained response is the map that was '
+             'computed before')
 
     mf = method.copy()
     # The inner SCF gradient tolerance is independent of the constraint
@@ -1455,7 +1529,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                 'UKS orbital residual %.6g exceeds %.6g' % (residual, limit))
         return local, residual
 
-    for value in axis:
+    for value in (() if cached is not None else axis):
         multiplier = float(value)
         try:
             state, residual = inner_solve(multiplier, density)
@@ -1508,6 +1582,15 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                                  'log': list(records)}
         raise cdft.ConvergenceError(
             'Branch scan found no converged constrained state: %s' % reason)
+
+    if cache_key is not None and cached is None:
+        # The scan of this axis is stored, so that the next target of the
+        # same constraint reuses it. The stored map is the map that was
+        # computed, with the same points, the same switches and the same
+        # densities, and the refinement of the next target starts from it.
+        scan_cache[cache_key] = {'points': points, 'switches': switches,
+                                  'converged_points': converged_points,
+                                  'records': list(records)}
 
     # The required branch identity, if any, is applied as a filter over the
     # scan points and not only as a check on the finally accepted root. A
