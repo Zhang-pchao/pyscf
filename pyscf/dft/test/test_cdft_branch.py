@@ -729,7 +729,7 @@ class BranchFiltering(unittest.TestCase):
                               'separation_electrons': 0.138}}]
         gap = cdft_branch._branch_gap(points, 14.0, evidence)
         self.assertIsNotNone(gap)
-        self.assertIn('separated by', gap)
+        self.assertIn('branch continuation remains unresolved', gap)
         # A target outside the two limits is not in the gap.
         self.assertIsNone(cdft_branch._branch_gap(points, 14.1, evidence))
         # A target that the coarse bracket would have hidden is found,
@@ -759,7 +759,7 @@ class BranchFiltering(unittest.TestCase):
         # But it is reported as reachable only from the other branch.
         unreachable = cdft_branch._branch_unreachable(evidence, 14.0)
         self.assertIsNotNone(unreachable)
-        self.assertIn('only from the other branch', unreachable)
+        self.assertIn('continuation from either branch remains untested', unreachable)
         # A target inside the gap is not reported this way.
         self.assertIsNone(cdft_branch._branch_unreachable(evidence, 13.0))
         # A target below the lower limit is out of range, not beyond a fold.
@@ -996,7 +996,7 @@ class PhysicalFingerprint(unittest.TestCase):
                               'separation_electrons': 0.138}}]
         gap = cdft_branch._branch_gap(points, 14.0, evidence)
         self.assertIsNotNone(gap)
-        self.assertIn('separated by', gap)
+        self.assertIn('branch continuation remains unresolved', gap)
 
     def test_the_branch_identity_tolerance_resolves_a_fragment_redistribution(self):
         # A redistribution of 0.079 electrons between fragments is a branch
@@ -1143,7 +1143,7 @@ class PhysicalFingerprint(unittest.TestCase):
                                 'separation_electrons': 0.439742})]
         gap = cdft_branch._branch_gap(points, 12.0, confirmed)
         self.assertIsNotNone(gap)
-        self.assertIn('separated by', gap)
+        self.assertIn('branch continuation remains unresolved', gap)
 
     def test_an_unconfirmed_discontinuity_is_reported_as_unresolved(self):
         # The unresolved case must be distinguishable from a gap and from a

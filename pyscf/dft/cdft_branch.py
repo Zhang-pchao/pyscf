@@ -40,11 +40,12 @@ Atomic units throughout.
 '''
 
 from dataclasses import dataclass, field
-import hashlib
+from copy import deepcopy
 
 import numpy as np
 
 from pyscf.dft import cdft
+from pyscf.dft.cdft_branch_cache import _scan_cache_key, project_points, record_points
 
 __all__ = ['BranchFingerprint', 'BranchScan', 'BranchSwitchError',
            'BranchGapError', 'BranchDomainError', 'solve_branch_aware']
@@ -55,14 +56,11 @@ class BranchSwitchError(cdft.ConvergenceError):
 
 
 class BranchGapError(BranchSwitchError):
-    '''The target population lies in a gap between two electronic branches.
+    """Legacy name for an unresolved target between measured solutions.
 
-    This is a statement about the model rather than about the numerics: the
-    constrained response is genuinely multivalued and the requested
-    population is not attained by any reachable branch. Reporting it
-    separately keeps a physically unreachable target from being mistaken for a
-    solver that failed to converge.
-    '''
+    Multiple solutions at one multiplier do not establish a fold, branch
+    endpoints, stability, or global absence of the target.
+    """
 
 
 class BranchDomainError(BranchSwitchError):
@@ -289,6 +287,17 @@ class BranchScan:
                 'points': self.points, 'switches': self.switches}
 
 
+@dataclass
+class BranchResult(cdft.Result):
+    """Constrained result plus an owned branch diagnostic snapshot."""
+    branch_scan: object = None
+    branch_switches: list = field(default_factory=list)
+    branch_density: object = None
+    branch_clusters: list = field(default_factory=list)
+    branch_rejected: list = field(default_factory=list)
+    branch_diagnostics: dict = field(default_factory=dict)
+
+
 def _scan_axis(bound, scan_points, scan_mode):
     '''Build the multiplier sampling axis.'''
     if scan_mode == 'uniform':
@@ -322,51 +331,6 @@ def _make_recorder(records, scan_log):
     return emit
 
 
-def _scan_cache_key(constraint, method, axis, inner_solver, inner_grad_tol,
-                    density_tol, scan_mode, fragment_weights):
-    """Return a fingerprint of everything that the branch scan depends on.
-
-    The scan of the constrained response depends on the constraint, on the
-    method, on the multiplier axis and on the solver controls. It does not
-    depend on the target, because the target selects a point of the map
-    that the scan produces. A key that omitted any of the dependencies would
-    let the scan of one configuration be reused for another, and the reused
-    map would then be a map of the wrong constraint. Every dependency is
-    therefore part of the key.
-    """
-    h = hashlib.sha256()
-    h.update(np.asarray(constraint.atom_weights, dtype='<f8').tobytes())
-    # The matrix of the constraint is hashed byte for byte, and so is the
-    # identity of the proatom references that the matrix is built from.
-    # Two independent constructions of the same constraint differ in the
-    # last bits of their matrices, because the atomic references are
-    # solved afresh, so the byte for byte hash is also the hash that
-    # distinguishes them. A caller that wants two states to share one
-    # scan has to share the construction of the constraint, and this key
-    # then reports that they do.
-    h.update(np.asarray(constraint.matrix, dtype='<f8').tobytes())
-    reference_hash = getattr(constraint, 'reference_sha256', None)
-    if reference_hash:
-        h.update(reference_hash.encode())
-    h.update(np.asarray(axis, dtype='<f8').tobytes())
-    h.update(str(inner_solver).encode())
-    h.update(np.float64(inner_grad_tol).tobytes())
-    h.update(np.float64(density_tol).tobytes())
-    h.update(str(scan_mode).encode())
-    h.update(str(getattr(method, 'xc', '')).encode())
-    h.update(str(getattr(method, 'conv_tol', '')).encode())
-    h.update(str(getattr(method, 'conv_tol_grad', '')).encode())
-    h.update(str(getattr(method, 'max_cycle', '')).encode())
-    h.update(str(getattr(method.grids, 'level', '')).encode())
-    h.update(str(getattr(method.grids, 'prune', '')).encode())
-    h.update(np.asarray([method.mol.natm, method.mol.nelectron]).tobytes())
-    h.update(method.mol.energy_nuc().tobytes() if hasattr(method.mol, 'energy_nuc')
-             else b'')
-    if fragment_weights is not None:
-        h.update(np.asarray(fragment_weights, dtype='<f8').tobytes())
-    return h.hexdigest()
-
-
 def _branch_mismatch(fingerprint, required_signed_spin, required_atom_spins,
                      spin_tol):
     '''Return a reason string when the fingerprint violates the required identity.
@@ -396,178 +360,34 @@ def _branch_mismatch(fingerprint, required_signed_spin, required_atom_spins,
     return None
 
 
-def _branch_gap(converged_points, target, discontinuity_evidence=None):
-    '''Describe a gap in the reachable population range that contains the target.
-
-    The constrained response can be multivalued: two electronic branches may
-    cover disjoint intervals of the population axis, so that a target between
-    them is attained by neither branch. The scan then reports "no point met
-    the tolerance", which reads like a numerical failure and invites a
-    tolerance that is then loosened.
-
-    This helper detects the structural situation instead. A gap is reported
-    only when the target falls strictly between two separated intervals that
-    no reachable point covers. A target outside the overall reachable range
-    is *not* a gap: it is simply out of range.
-
-    The evidence for a discontinuity is the refinement's own observation: a
-    trial on the bracketed branch must agree with the linear interpolation of
-    the bracket, and a trial that does not agree has crossed into another
-    branch. This is the reliable signal, because it is measured *on* the
-    branch rather than inferred from a coarse grid.
-
-    A coarse scan alone cannot settle the question. On the V2-04c D1 case
-    the response moves by 1.9 electrons across a scan step of 0.125 Hartree
-    in the smooth part and by 0.14 electrons across a step of 0.0005 Hartree
-    at the true discontinuity, so no threshold on the jump alone separates
-    them. The refinement resolves the discontinuity because it measures the
-    response at the scale of the bracket it is refining.
-
-    Measured on the V2-04c D1 case, the two limits of the discontinuity at
-    lambda ~ 0.0236 carried the same total spin to 1e-6, the same spin square
-    to 0.001 and a density overlap of 0.998, while the constrained population
-    differed by 0.142 electrons. An identity built on the total spin and the
-    spin square alone merges them and reports no gap.
-
-    The limits of the gap are the populations that the two branches actually
-    reach, and they are taken from the *observed* trials, not from the coarse
-    scan bracket. This distinction decides the outcome on the V2-04c D1 case.
-    The coarse bracket that straddles the fold spans the populations 14.173
-    and 12.259, and the target 14.0 lies below the lower limit, so the coarse
-    bracket reports "out of range". The observed limits are 14.0528 on the
-    lower branch and 13.9145 on the upper branch, and the target 14.0 lies
-    strictly between them. Only the observed limits identify the target as
-    unattainable; the coarse bracket hides the gap entirely.
-
-    The comparison is direction agnostic, because the constrained population
-    may decrease or increase with the multiplier depending on the sign of the
-    constraint weights.
-
-    Args:
-        converged_points: the converged scan points.
-        target: the requested population.
-        discontinuity_evidence: the discontinuities that the refinement
-            observed, as recorded by :func:`_refine`.
-
-    Returns a description string, or ``None`` when the target is not inside a
-    structural gap.
-    '''
+def _branch_gap(converged_points, target, discontinuity_evidence=None,
+                population_tol=1e-8):
+    """Describe local multivalued evidence, without inferring unattainability."""
     if not converged_points:
         return None
-    # Only a confirmed fold establishes a structural gap.
-    #
-    # A discontinuity that was observed but not confirmed is not enough. The
-    # anomaly that triggers the confirmation is the disagreement between a
-    # refinement trial and the linear interpolation of its bracket, and that
-    # disagreement is produced by *any* target that lies inside the bracket,
-    # not only by a genuine discontinuity of the constrained response. A
-    # target that lies between two scan points therefore produces the same
-    # observation as a fold does, and the two cannot be told apart from the
-    # refinement alone.
-    #
-    # The difference is decisive for the conclusion, and the scope of the
-    # conclusion matters as much as its kind. A confirmed fold means that
-    # within the searched multiplier domain, and from the starting
-    # densities that were tested, no branch attained the target. That is a
-    # statement about the *search*, not about the model. A response that is
-    # multivalued at one multiplier is not thereby exhausted: a branch may
-    # attain the target at a different multiplier, and the search did not
-    # follow the branch past the point where the fold was detected.
-    #
-    # The counterexample is elementary and needs no electronic structure
-    # calculation. Two smooth decreasing responses, C_A(lambda) = -lambda
-    # and C_B(lambda) = 2 - lambda, are multivalued at lambda = 0, where
-    # they give 0 and 2. A target of 1 lies strictly between the two
-    # populations, yet it is attained by A at lambda = -1 and by B at
-    # lambda = +1. The premise therefore does not imply that the target is
-    # unattainable. A multivalued response at one multiplier is evidence of
-    # multiple stationary solutions of the constrained problem, which is a
-    # real and useful observation, and it is not evidence that the target
-    # does not exist.
-    #
-    # An unconfirmed observation means only that the target was not
-    # reached from the bracketed side at the resolution of the search, which
-    # is a statement about the search and may be resolved by a denser scan
-    # or by a tighter criterion. Reporting either as a global absence of
-    # the target turns a numerical limitation into a scientific conclusion.
-    #
-    # The limits of the gap are the populations that the two branches
-    # actually reach, and they are taken from the *observed* trials of the
-    # confirmed fold, not from the coarse scan bracket. This distinction
-    # decides the outcome on the V2-04c D1 case: the coarse bracket that
-    # straddles the fold spans the populations 14.173 and 12.259, and the
-    # target 14.0 lies below the lower limit, so the coarse bracket reports
-    # "out of range". The observed limits are 14.0528 on the lower branch
-    # and 13.9145 on the upper branch, and the target 14.0 lies strictly
-    # between them. Only the observed limits identify the target as
-    # unattainable; the coarse bracket hides the gap entirely.
-    #
-    # The comparison is direction agnostic, because the constrained
-    # population may decrease or increase with the multiplier depending on
-    # the sign of the constraint weights.
-    for evidence in (discontinuity_evidence or []):
-        # A fold that was confirmed by the strict multivaluedness test gives
-        # the two limits of the gap directly: those are the populations that
-        # the two branches actually reach.
-        fold = evidence.get('fold')
-        if fold is None:
-            # Not confirmed by the strict test. The observation is recorded
-            # as evidence but it does not establish a gap.
+    if any(abs(point[1] - target) <= population_tol for point in converged_points):
+        return None
+    for evidence in discontinuity_evidence or []:
+        observed = evidence.get("fold")  # Legacy key, not a proven fold.
+        if observed is None:
             continue
-        limits = [float(x) for x in fold['limits']]
-        if len(limits) < 2:
-            continue
-        lower, upper = min(limits), max(limits)
-        if lower < target < upper:
-            return ('reachable populations stop at %.6f and resume at %.6f '
-                    '(the two branches are separated by %.6f electrons)'
-                    % (lower, upper, upper-lower))
+        limits = observed.get("limits", [])
+        if len(limits) == 2 and min(limits) < target < max(limits):
+            return ("target lies between measured populations %.6f and %.6f "
+                    "at one multiplier; branch continuation remains unresolved"
+                    % (min(limits), max(limits)))
     return None
 
 
 def _branch_unreachable(discontinuity_evidence, target):
-    '''Describe a target that only the other branch can reach.
-
-    A confirmed fold has two limits. When the target lies strictly between
-    them, it is a structural gap: neither branch reaches it. When the target
-    lies *beyond* the upper limit, the situation is different: the upper
-    branch does reach it, but the branch that the refinement was following
-    does not, so the refinement cannot get there from the bracketed side.
-
-    The two situations must not be conflated. A gap is a statement about the
-    searched domain and the tested seeds: within the domain that was
-    searched, no branch that the search followed attained the target. A
-    target beyond the fold is a statement about the *search*: the target
-    exists, but the warm start has to be taken from the other side of the
-    fold. Reporting the second as a bare failure to converge hides the fact
-    that the target is attainable.
-
-    Measured on the V2-04c D1 case at the 1.33 Angstrom geometry: the fold
-    limits are 12.434 and 13.786 while the target is 14.0, so the target is
-    reachable only from the upper branch. The refinement followed the lower
-    branch and consumed its whole iteration budget before the caller learned
-    only that it "did not converge".
-
-    Returns a description string, or ``None`` when no such fold was observed.
-    '''
-    best = None
-    for evidence in (discontinuity_evidence or []):
-        fold = evidence.get('fold')
-        if fold is None:
-            continue
-        limits = [float(x) for x in fold['limits']]
-        if len(limits) < 2:
-            continue
-        lower, upper = min(limits), max(limits)
-        if target > upper:
-            best = (lower, upper)
-    if best is None:
-        return None
-    lower, upper = best
-    return ('the target population %.6g lies beyond the upper branch limit '
-            '%.6f; it is attainable only from the other branch, and the '
-            'bracketed branch stops at %.6f'
-            % (target, upper, lower))
+    """Legacy helper: report a target beyond observations, not its existence."""
+    for evidence in discontinuity_evidence or []:
+        observed = evidence.get("fold")
+        if observed is not None and target > max(observed["limits"]):
+            return ("target %.6g exceeds measured populations %.6f and %.6f; "
+                    "continuation from either branch remains untested"
+                    % (target, min(observed["limits"]), max(observed["limits"])))
+    return None
 
 
 def _domain_exhaustion(converged_points, target, bound):
@@ -746,24 +566,11 @@ def _same_branch(first, second, tol):
 def _probe_multivalued(multiplier, left_density, right_density, inner_solve,
                        population_of, overlap, eigvals, eigvecs,
                        fragment_weights=None, tolerance=1e-6):
-    '''Test whether the constrained response is multivalued at one multiplier.
+    """Test two seeds at one multiplier; this does not locate a fold.
 
-    This is the *definition* of a fold of the constrained response: at one
-    fixed multiplier, two different initial densities both converge to
-    different self-consistent solutions. Nothing weaker establishes it. A
-    population that jumps between two neighbouring multipliers may be a
-    genuine discontinuity, or it may be an artefact of the warm-start
-    history; the difference is decided here, by solving the same multiplier
-    from both sides and comparing the two answers.
-
-    The two solutions differ in the localisation of the electronic hole, so
-    their fingerprint differs in the fragment spin distribution while their
-    total spin and spin square agree. The populations are what the caller
-    needs: they are the two limits of the fold.
-
-    Returns a description of the fold, or ``None`` when the response is
-    single valued at that multiplier.
-    '''
+    Legacy limits contain measured populations, not branch endpoints.
+    Finding only one solution also does not prove uniqueness.
+    """
     solutions = []
     for start in (left_density, right_density):
         if start is None:
@@ -789,7 +596,9 @@ def _probe_multivalued(multiplier, left_density, right_density, inner_solve,
         fingerprint = _fingerprint(state, density, population, overlap,
                                    eigvals, eigvecs, None, fragment_weights)
         fingerprints.append(fingerprint)
-    return {'multiplier_hartree': float(multiplier),
+    return {'evidence_kind': 'multivalued_at_fixed_multiplier',
+            'global_reachability': 'NOT_ASSESSED', 'fold_proven': False,
+            'multiplier_hartree': float(multiplier),
             'populations': [float(first[0]), float(second[0])],
             'limits': [float(lower), float(upper)],
             'separation_electrons': float(upper-lower),
@@ -1183,7 +992,7 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 evidence['population'] = float(fold['limits'][0])
                 evidence['bracket_prediction'] = float(fold['limits'][1])
                 if emit is not None:
-                    emit('  FOLD CONFIRMED at lambda=%+.12g: the response is '
+                    emit('  MULTIVALUED at lambda=%+.12g: the response is '
                          'multivalued, the branches reach %.9f and %.9f'
                          % (clipped, fold['limits'][0], fold['limits'][1]))
                 # A confirmed fold whose two limits straddle the target is a
@@ -1196,7 +1005,7 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
                 if fold_lower < target < fold_upper:
                     structural_gap = True
                     if emit is not None:
-                        emit('  STRUCTURAL GAP: the target %.9g lies between '
+                        emit('  UNRESOLVED TARGET: the target %.9g lies between '
                              'the branch limits %.9f and %.9f; the refinement '
                              'stops without a root' % (target, fold_lower,
                                                       fold_upper))
@@ -1355,6 +1164,37 @@ def _refine(converged_points, target, population_tol, inner_solve, density_tol,
     return None, discontinuity_evidence
 
 
+def _inner_solver(method, constraint, hcore, inner_solver, inner_lindep,
+                  inner_grad_tol, limit):
+    """Construct the fixed-multiplier operation used by scan/refinement."""
+    def inner_solve(multiplier, start_density):
+        '''Run one fully converged inner UKS at a fixed multiplier.'''
+        local = method.copy()
+        local.conv_tol_grad = inner_grad_tol
+        local.grids = method.grids.copy()
+        local.chkfile = None
+        local.get_hcore = lambda mol=None: hcore+multiplier*constraint.matrix
+        if inner_solver == 'newton':
+            inner = local.newton()
+            inner.ah_lindep = inner_lindep
+            inner.ah_conv_tol = min(inner.ah_conv_tol, (local.conv_tol_grad*.1)**2)
+            inner.kernel(dm0=start_density)
+            local = inner.undo_soscf()
+        else:
+            local.kernel(dm0=start_density)
+        residual = float(np.linalg.norm(local.get_grad(local.mo_coeff, local.mo_occ)))
+        if not local.converged:
+            raise cdft.ConvergenceError(
+                'UKS %s did not converge at multiplier %.12g; orbital residual %.12g'
+                % (inner_solver, multiplier, residual))
+        if not np.isfinite(residual) or residual > limit:
+            raise cdft.ConvergenceError(
+                'UKS orbital residual %.6g exceeds %.6g' % (residual, limit))
+        return local, residual
+
+    return inner_solve
+
+
 def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                        population_tol=1e-8, max_multiplier=1., max_iterations=40,
                        inner_solver='newton', inner_lindep=1e-24,
@@ -1418,6 +1258,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         ``branch_scan`` and ``branch_switches`` attributes describing the
         scan, so failures remain diagnosable after the fact.
     '''
+    cdft.LAST_BRANCH_SCAN = None
     if scan_points < 5:
         raise ValueError('A branch scan needs at least five grid points')
     if not (0 < density_tol <= 1):
@@ -1486,13 +1327,15 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
     if scan_cache is not None:
         cache_key = _scan_cache_key(constraint, method, axis, inner_solver,
                                     inner_grad_tol, density_tol, scan_mode,
-                                    fragment_weights)
+                                    fragment_weights, dm0=dm0,
+                                    inner_lindep=inner_lindep)
         cached = scan_cache.get(cache_key)
     if cached is not None:
-        points = cached['points']
+        cached = deepcopy(cached)
+        points = project_points(cached['points'], target)
         switches = cached['switches']
         converged_points = cached['converged_points']
-        records = list(cached['records'])
+        records = []
     else:
         records = []
     emit = _make_recorder(records, scan_log)
@@ -1501,6 +1344,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
              'constraint, the method and the solver controls are the same, '
              'so the map of the constrained response is the map that was '
              'computed before')
+        record_points(points, emit)
 
     mf = method.copy()
     mf.conv_tol_grad = inner_grad_tol
@@ -1522,31 +1366,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         # leave the solver with no point to select from.
         converged_points = []
 
-    def inner_solve(multiplier, start_density):
-        '''Run one fully converged inner UKS at a fixed multiplier.'''
-        nonlocal mf
-        local = method.copy()
-        local.conv_tol_grad = inner_grad_tol
-        local.grids = method.grids.copy()
-        local.chkfile = None
-        local.get_hcore = lambda mol=None: hcore+multiplier*constraint.matrix
-        if inner_solver == 'newton':
-            inner = local.newton()
-            inner.ah_lindep = inner_lindep
-            inner.ah_conv_tol = min(inner.ah_conv_tol, (local.conv_tol_grad*.1)**2)
-            inner.kernel(dm0=start_density)
-            local = inner.undo_soscf()
-        else:
-            local.kernel(dm0=start_density)
-        residual = float(np.linalg.norm(local.get_grad(local.mo_coeff, local.mo_occ)))
-        if not local.converged:
-            raise cdft.ConvergenceError(
-                'UKS %s did not converge at multiplier %.12g; orbital residual %.12g'
-                % (inner_solver, multiplier, residual))
-        if not np.isfinite(residual) or residual > limit:
-            raise cdft.ConvergenceError(
-                'UKS orbital residual %.6g exceeds %.6g' % (residual, limit))
-        return local, residual
+    inner_solve = _inner_solver(method, constraint, hcore, inner_solver,
+                                inner_lindep, inner_grad_tol, limit)
 
     for value in (() if cached is not None else axis):
         multiplier = float(value)
@@ -1613,9 +1434,10 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
         # same constraint reuses it. The stored map is the map that was
         # computed, with the same points, the same switches and the same
         # densities, and the refinement of the next target starts from it.
-        scan_cache[cache_key] = {'points': points, 'switches': switches,
-                                  'converged_points': converged_points,
-                                  'records': list(records)}
+        scan_cache[cache_key] = deepcopy({
+            'points': [{k: v for k, v in point.items() if k != 'residual'}
+                       for point in points],
+            'switches': switches, 'converged_points': converged_points})
 
     # The required branch identity, if any, is applied as a filter over the
     # scan points and not only as a check on the finally accepted root. A
@@ -1699,7 +1521,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             # reported as an unresolved search, which is a different
             # situation and calls for a different action: a denser scan or
             # a tighter criterion, rather than a written-off conclusion.
-            gap = _branch_gap(converged_points, target, discontinuity_evidence)
+            gap = _branch_gap(converged_points, target, discontinuity_evidence,
+                              population_tol)
             unreachable = None
             unresolved = None
             # The target may lie beyond the searched multiplier domain. This
@@ -1714,9 +1537,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
             # statement about the part of the axis that was not searched.
             exhausted = _domain_exhaustion(converged_points, target, bound)
             if gap is not None:
-                reason = ('the target population %.6g lies in a gap between two '
-                          'electronic branches within the searched multiplier '
-                          'domain and the tested starting densities: %s'
+                reason = ('the target population %.6g remains unresolved after '
+                          'observing multiple stationary solutions: %s'
                           % (target, gap))
             elif exhausted is not None:
                 reason = ('the target population %.6g is outside the searched '
@@ -1770,6 +1592,8 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                                      'branches': branches,
                                      'rejected_by_branch': rejected_by_branch,
                                      'branch_gap': gap,
+                                     'global_reachability': 'NOT_ASSESSED',
+                                     'fold_proven': False,
                                      'branch_unreachable': unreachable,
                                      'branch_unresolved': unresolved,
                                      'domain_exhaustion': exhausted,
@@ -1809,7 +1633,7 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
 
     scan = BranchScan(converged=True, root=root, population=population,
                       energy=energy, points=points, switches=switches, reason='')
-    result = cdft.Result(root_state, constraint, float(target), root,
+    result = BranchResult(root_state, constraint, float(target), root,
                           population, energy, points)
     result.branch_scan = scan
     result.branch_switches = switches
@@ -1833,4 +1657,5 @@ def solve_branch_aware(method, constraint, target, *, dm0=None, multiplier0=0.,
                              'curvature_deviations': [],
                              'discontinuities': [],
                              'log': list(records)}
+    result.branch_diagnostics = deepcopy(cdft.LAST_BRANCH_SCAN)
     return result
